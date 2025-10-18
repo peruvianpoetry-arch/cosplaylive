@@ -1,0 +1,4 @@
+flask
+python-telegram-bot==20.7
+googletrans==4.0.0-rc1
+stripe
