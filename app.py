@@ -4,17 +4,18 @@ from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
+# --- Variables de entorno ---
 TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 PORT = int(os.getenv("PORT", "5000"))
 
-# --- Flask para mantener un puerto abierto en Render ---
+# --- Flask (mantiene el servicio activo en Render) ---
 web = Flask(__name__)
 
 @web.get("/")
 def home():
     return "✅ Cosplaylive bot está corriendo"
 
-def run_web():
+def start_web():
     web.run(host="0.0.0.0", port=PORT)
 
 # --- Handlers del bot ---
@@ -26,14 +27,14 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 if __name__ == "__main__":
     if not TOKEN:
-        raise SystemExit("⚠️ Falta TELEGRAM_TOKEN en Environment.")
+        raise SystemExit("⚠️ Falta TELEGRAM_TOKEN en las variables de entorno.")
 
-    # 1) Iniciar Flask en segundo plano
-    threading.Thread(target=run_web, daemon=True).start()
+    # 1️⃣ Inicia Flask en un hilo secundario
+    threading.Thread(target=start_web, daemon=True).start()
 
-    # 2) Iniciar el bot en el hilo principal (evita error de event loop)
+    # 2️⃣ Ejecuta el bot en el hilo principal (soluciona el error del event loop)
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
-    print("🤖 Iniciando bot (polling)…")
+    print("🤖 Iniciando bot con polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
