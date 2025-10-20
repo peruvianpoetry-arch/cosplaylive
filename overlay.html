@@ -1,2 +1,21 @@
-<!doctype html>
-<html><head><meta charset='utf-8'><title>Overlay</title></head><body><p>Overlay running.</p></body></html>
+<!doctype html><html><head><meta charset="utf-8">
+<title>Overlay Chat</title>
+<style>
+ html,body{margin:0;padding:0;background:transparent}
+ #wrap{font:16px/1.35 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;color:#fff;padding:8px}
+ .msg{margin:6px 0;padding:10px 14px;background:rgba(0,0,0,.35);border-radius:14px;backdrop-filter:blur(2px)}
+ .user{opacity:.85;font-size:14px}.text{font-size:18px}
+</style></head><body><div id="wrap"></div>
+<script>
+const wrap=document.getElementById('wrap');
+const ev=new EventSource('/events');
+ev.onmessage=e=>{
+  const {user,text}=JSON.parse(e.data);
+  const d=document.createElement('div');
+  d.className='msg';
+  d.innerHTML=`<div class="user">${user}</div><div class="text">${text}</div>`;
+  wrap.appendChild(d);
+  while(wrap.children.length>20) wrap.removeChild(wrap.firstChild);
+  window.scrollTo(0,document.body.scrollHeight);
+};
+</script></body></html>
