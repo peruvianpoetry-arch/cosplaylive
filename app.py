@@ -129,21 +129,36 @@ async def donate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Error al crear pago: {e}")
 
 # ---------- Main ----------
-if __name__ == "__main__":
+# ---------- Main (async, estable en Py 3.10) ----------
+import asyncio
+
+async def main():
     if not TOKEN:
         raise SystemExit("⚠️ Falta TELEGRAM_TOKEN en Environment.")
 
+    # Inicia Flask en segundo plano (sin reloader, ya lo tenemos arriba)
     threading.Thread(target=run_web, daemon=True).start()
 
-    app = ApplicationBuilder().token(TOKEN).build()
-    asyncio.run(app.bot.delete_webhook(drop_pending_updates=True))
+    # Crea la app de Telegram
+    application = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("donar", donate_cmd))
-    app.add_handler(MessageHandler(filters.ChatType.CHANNEL, channel_post))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo_msg))
+    # Limpia webhook para evitar conflictos con polling
+    await application.bot.delete_webhook(drop_pending_updates=True)
+
+    # Registra handlers
+    application.add_handler(CommandHandler("start", start_cmd))
+    application.add_handler(CommandHandler("donar", donate_cmd))
+    application.add_handler(MessageHandler(filters.ChatType.CHANNEL, channel_post))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo_msg))
 
     log.info("🤖 Iniciando bot (polling)…")
-    import asyncio
-    asyncio.set_event_loop(asyncio.new_event_loop())
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+    # Secuencia recomendada por PTB 20.x (todo asíncrono):
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(drop_pending_updates=True)
+    # Espera hasta que el proceso reciba señal de stop
+    await application.updater.idle()
+
+if __name__ == "__main__":
+    asyncio.run(main())
