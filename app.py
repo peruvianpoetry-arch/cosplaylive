@@ -46,7 +46,7 @@ async def channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("❌ Handler error", exc_info=context.error)
 
-# ---------- MAIN (polling síncrono estable en Py 3.10) ----------
+# ---------- MAIN (polling SÍNCRONO, sin asyncio.run) ----------
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("⚠️ Falta TELEGRAM_TOKEN en Environment.")
@@ -57,7 +57,7 @@ if __name__ == "__main__":
     # 2) Construye la app de Telegram
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # 3) Elimina webhook antes de hacer polling (evita conflictos)
+    # 3) Borra webhook para evitar conflictos con polling
     try:
         import asyncio
         asyncio.run(app.bot.delete_webhook(drop_pending_updates=True))
@@ -72,9 +72,9 @@ if __name__ == "__main__":
 
     log.info("🤖 Iniciando bot (polling síncrono)…")
 
-    # 5) Arranca polling (síncrono). No cierra el proceso ni el loop.
+    # 5) Arranca polling síncrono (no cierra loops, no señales raras)
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
-        stop_signals=None  # evita señales no soportadas en algunos hosts
+        stop_signals=None
     )
