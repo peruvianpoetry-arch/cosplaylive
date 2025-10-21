@@ -1,9 +1,14 @@
-import os, threading, logging
+import sys, os, threading, logging
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,
+)
 log = logging.getLogger("cosplaylive")
 
 TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
@@ -45,8 +50,6 @@ if __name__ == "__main__":
     threading.Thread(target=run_web, daemon=True).start()
 
     app = ApplicationBuilder().token(TOKEN).build()
-
-    # Handlers
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, channel_post))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo_msg))
@@ -54,7 +57,8 @@ if __name__ == "__main__":
 
     log.info("🤖 Iniciando bot (polling SÍNCRONO, sin websockets ni bucles raros)…")
 
-    # Polling síncrono, sin señales para evitar cierres de loop en hosts
-    app.run_polling(allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True,
-                    stop_signals=None)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        stop_signals=None
+    )
