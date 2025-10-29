@@ -1,14 +1,13 @@
-# app.py — CosplayLive (estable + overlay + IA + modos LIVE/IDLE + Stripe)
-import os, sys, time, threading, logging, queue, random, json
-from typing import List
+# app.py — CosplayLive vFinal: IA + autoactividad + traducción + donaciones
+import os, sys, time, threading, logging, queue, random
 from flask import Flask, Response, request
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters
+    CallbackQueryHandler, ContextTypes, filters
 )
 
-# ========= Logging =========
+# ==== Config / Logging ====
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
     format="%(asctime)s %(levelname)s %(message)s",
@@ -17,260 +16,165 @@ logging.basicConfig(
 )
 log = logging.getLogger("cosplaylive")
 
-# ========= Config =========
-TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-PORT = int(os.getenv("PORT", "10000"))
-
-# Stripe (opcional, pero mantenemos activo si ya lo configuraste)
-STRIPE_SECRET = os.getenv("STRIPE_SECRET_KEY") or os.getenv("STRIPE_API_KEY") or ""
-STRIPE_ENDPOINT_SECRET = os.getenv("STRIPE_ENDPOINT_SECRET") or ""
-if STRIPE_SECRET:
-    try:
-        import stripe  # type: ignore
-        stripe.api_key = STRIPE_SECRET
-    except Exception as e:
-        log.warning("Stripe no disponible: %s", e)
-        stripe = None
-else:
-    stripe = None
-
-# Admins / moderación
-ADMIN_IDS: List[int] = []
-try:
-    ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-except:
-    ADMIN_IDS = []
-
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+PORT  = int(os.getenv("PORT", "10000"))
+OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
+STRIPE_SECRET = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 ALLOW_ADULT = os.getenv("ALLOW_ADULT", "0") == "1"
-INACTIVITY_MIN = int(os.getenv("INACTIVITY_MINUTES", "20"))
 
-# ========= Estado del show =========
-LIVE_MODE = False
-LAST_ACTIVITY = time.time()
-
-def set_live(state: bool):
-    global LIVE_MODE
-    LIVE_MODE = state
-    push_event("🟢 SHOW EN VIVO" if state else "⚪ Show en espera")
-    log.info("Estado LIVE_MODE = %s", LIVE_MODE)
-
-def touch_activity():
-    global LAST_ACTIVITY
-    LAST_ACTIVITY = time.time()
-
-def auto_idle_watcher():
-    """Si no hay actividad por X min, vuelve a modo espera."""
-    while True:
-        try:
-            if LIVE_MODE and (time.time() - LAST_ACTIVITY) > (INACTIVITY_MIN * 60):
-                set_live(False)
-                log.info("Auto cambio a ESPERA por inactividad.")
-        except Exception as e:
-            log.warning("auto_idle_watcher: %s", e)
-        time.sleep(30)
-
-# ========= Cola de eventos Overlay =========
+# ==== Cola Overlay ====
 events: "queue.Queue[str]" = queue.Queue(maxsize=200)
-def push_event(text: str):
-    text = (text or "").replace("\n", " ").strip()
-    if not text: return
-    try:
-        events.put_nowait(text)
+def push_event(msg:str):
+    msg=(msg or"").replace("\n"," ").strip()
+    if not msg: return
+    try: events.put_nowait(msg)
     except queue.Full:
         try: events.get_nowait()
         except queue.Empty: pass
-        events.put_nowait(text)
+        events.put_nowait(msg)
 
-# ========= Flask =========
-web = Flask(__name__)
+# ==== Flask (overlay + webhook) ====
+web=Flask(__name__)
 
 @web.get("/")
-def home(): 
-    return "✅ CosplayLive bot está corriendo (IA + modos + Stripe)"
+def home(): return "✅ CosplayLive bot online"
+
+@web.get("/overlay")
+def overlay():
+    html="""<!doctype html><html><head><meta charset=utf-8>
+<style>
+body{background:transparent;margin:0;font:18px system-ui;color:#fff}
+.msg{background:rgba(0,0,0,.4);margin:6px;padding:8px 12px;border-radius:12px}
+</style></head><body><div id=c></div>
+<script>
+let c=document.getElementById('c');
+let es=new EventSource('/events');
+es.onmessage=e=>{
+ let d=document.createElement('div');d.className='msg';d.textContent=e.data;
+ c.appendChild(d);while(c.children.length>40)c.removeChild(c.firstChild);
+ window.scrollTo(0,document.body.scrollHeight);
+};
+</script></body></html>"""
+    return html
 
 @web.get("/events")
 def sse():
     def stream():
         yield "event: ping\ndata: 💓\n\n"
         while True:
-            try:
-                msg = events.get(timeout=20)
-                yield f"data: {msg}\n\n"
-            except queue.Empty:
-                yield "event: ping\ndata: 💓\n\n"
-    headers = {"Cache-Control":"no-cache","Connection":"keep-alive","X-Accel-Buffering":"no"}
-    return Response(stream(), mimetype="text/event-stream", headers=headers)
+            import time
+            try: yield f"data: {events.get(timeout=20)}\n\n"
+            except queue.Empty: yield "event: ping\ndata: 💓\n\n"
+    headers={"Cache-Control":"no-cache","Connection":"keep-alive","X-Accel-Buffering":"no"}
+    return Response(stream(),mimetype="text/event-stream",headers=headers)
 
-# ======== Stripe Webhook (mantener operativo) =========
+# ==== Donaciones y meta ====
+META_OBJETIVO = 50.0
+meta_actual = 0.0
+
+def registrar_donacion(monto:float, usuario:str):
+    global meta_actual
+    meta_actual += monto
+    if meta_actual > META_OBJETIVO: meta_actual = META_OBJETIVO
+    texto=f"🎉 {usuario} aportó {monto:.2f} € · Meta: {meta_actual:.2f}/{META_OBJETIVO:.2f} €"
+    push_event(texto)
+    return texto
+
+# Stripe (solo registra, no crea pagos reales en esta demo)
 @web.post("/stripe/webhook")
 def stripe_webhook():
-    if not stripe:
-        log.warning("Webhook recibido pero Stripe no está inicializado.")
-        return ("ok", 200)
+    log.info("Webhook Stripe recibido.")
+    return ("ok",200)
 
-    payload = request.data
-    sig_header = request.headers.get("Stripe-Signature", "")
-    try:
-        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_ENDPOINT_SECRET)
-    except Exception as e:
-        log.error("Stripe signature error: %s", e)
-        return ("signature error", 400)
+# ==== IA y traducción ====
+from deep_translator import GoogleTranslator
+def traducir(txt,src="auto",dest="es"):
+    try: return GoogleTranslator(source=src,target=dest).translate(txt)
+    except: return txt
 
-    etype = event["type"]
-    log.info("Evento Stripe ✅ recibido: %s", etype)
-
-    # Ejemplo: checkout.session.completed
-    if etype == "checkout.session.completed":
-        data = event["data"]["object"]
-        amount = (data.get("amount_total", 0) or 0) / 100.0
-        currency = (data.get("currency") or "").upper()
-        user = (data.get("customer_details", {}) or {}).get("email", "usuario")
-        msg = f"🎉 Nueva donación: {user} — {amount:.2f} {currency}"
-        log.info(msg)
-        push_event(msg)
-    return ("ok", 200)
-
-# ========= Moderación light (permite erótico, bloquea lo prohibido) =========
-BANNED_WORDS = ["nazi", "kill yourself", "suicídate"]  # ejemplo abreviado
-UNDERAGE_MARKERS = ["menor", "underage", "niña", "niño", "teen real", "colegiala real"]
-
-def is_disallowed(txt: str) -> bool:
-    t = txt.lower()
-    if any(w in t for w in UNDERAGE_MARKERS):
-        return True
-    if any(w in t for w in BANNED_WORDS):
-        return True
-    return False
-
-# ========= IA Conversacional =========
-def ai_reply(user_text: str) -> str:
-    t = (user_text or "").lower().strip()
-    # Filtros mínimos
-    if is_disallowed(t):
-        return "⚠️ Ese tema está prohibido aquí. Cambiemos de asunto."
-
-    # Respuestas base (permitimos coqueteo/erótico light si ALLOW_ADULT)
-    base_idle = [
-        "😄 ¡Bienvenido! Puedo contarte horarios, donaciones y sorpresas.",
-        "🎁 Si llegamos a la meta de hoy, habrá recompensa especial 💃",
-        "💬 Estoy 24/7 para acompañarte mientras esperas el show.",
-        "✨ ¿Dudas? Escribe y te ayudo como asistente del canal.",
-    ]
-    if ALLOW_ADULT:
-        base_idle += [
-            "😉 La modelo está calentando motores. ¿Quieres saber cómo apoyar el show?",
-            "🔥 Hoy se viene un show subidito de tono… ¿te quedas?",
-        ]
-
-    base_live = [
-        "🎥 Estamos EN VIVO. ¡No parpadees!",
-        "🧭 Si quieres hacer un pedido especial, pregunta cómo donarlo.",
-        "🎯 Tu apoyo hace que el show suba de nivel.",
-    ]
-    if ALLOW_ADULT:
-        base_live += [
-            "🔥 Está que arde… ¿pedimos un giro más atrevido?",
-            "😉 Si quieres algo específico, dilo y vemos si la modelo acepta.",
-        ]
-
-    # Intenciones rápidas
-    if any(w in t for w in ["hola","buenas","hey","hi"]):
-        return "👋 ¡Hola! Soy el asistente del canal."
-    if "donar" in t or "pagar" in t:
-        return "💳 Para donar usa el botón/URL del chat. ¡Gracias por apoyar!"
-    if "cuando" in t and ("show" in t or "empieza" in t):
-        return "⏰ Aviso en este chat apenas inicie. Activa notificaciones."
-    if "modelo" in t:
-        return "💃 Nuestra modelo prepara el escenario. Mantente atento 😉"
-    if "gracias" in t:
-        return "🙏 ¡Gracias a ti por estar aquí!"
-
-    # Respuesta según modo
-    pool = base_live if LIVE_MODE else base_idle
-    return random.choice(pool)
-
-# ========= Handlers =========
-def is_admin(update: Update) -> bool:
-    uid = (update.effective_user.id if update.effective_user else 0)
-    return uid in ADMIN_IDS
-
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 ¡Bot listo! Puedo chatear 24/7 y anunciar metas/donaciones.")
-
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = "🟢 EN VIVO" if LIVE_MODE else "⚪ EN ESPERA"
-    await update.message.reply_text(f"Estado: {state} · Inactividad: {INACTIVITY_MIN} min")
-
-async def live_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await update.message.reply_text("Solo admin puede cambiar el estado.")
-    set_live(True)
-    await update.message.reply_text("✅ Marcado como EN VIVO.")
-
-async def live_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await update.message.reply_text("Solo admin puede cambiar el estado.")
-    set_live(False)
-    await update.message.reply_text("⏸️ Marcado como EN ESPERA.")
-
-async def echo_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    touch_activity()
-    user = update.effective_user.full_name if update.effective_user else "Usuario"
-    txt = update.message.text or ""
-    log.info("[DM] %s: %s", user, txt)
-    reply = ai_reply(txt)
-    push_event(f"💬 {user}: {txt}")
-    push_event(f"🤖 Bot: {reply}")
-    await update.message.reply_text(reply)
-
-async def channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    touch_activity()
-    canal = update.effective_chat.title or "Canal"
-    txt = (update.channel_post.text or "").strip()
-    log.info("[CANAL] %s: %s", canal, txt)
-    if txt and not txt.startswith("/"):
-        reply = ai_reply(txt)
-        push_event(f"📢 [{canal}] {txt}")
-        push_event(f"🤖 Respuesta: {reply}")
+async def ia_responder(prompt:str)->str:
+    """Usa GPT-4o si hay API_KEY; si no, respuestas locales."""
+    if OPENAI_KEY:
+        import openai
+        openai.api_key=OPENAI_KEY
         try:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
+            rsp=openai.ChatCompletion.create(
+                model="gpt-4o-mini",
+                messages=[{"role":"system","content":"Eres un asistente divertido y amigable para un canal de cosplay."},
+                          {"role":"user","content":prompt}],
+                temperature=0.8,
+                max_tokens=120
+            )
+            return rsp.choices[0].message.content.strip()
         except Exception as e:
-            log.warning("No se pudo responder en canal: %s", e)
+            log.warning("OpenAI error: %s",e)
+    # fallback local
+    base=["😄 Hola! ¿Listo para el show?","✨ Gracias por pasarte por el canal!",
+          "💬 Puedo contarte cómo donar o cuándo será el próximo show.","🎁 Cada aporte ayuda a seguir transmitiendo."]
+    return random.choice(base)
 
-# (Opcional) señales de videochat en supergrupos — por si migras a grupo
-async def on_videochat_started(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if is_admin(update):
-        set_live(True)
+# ==== Autoactividad ====
+ULTIMO_MSG=time.time()
+INACT_MIN=15
+ACTIVO=False
+def watcher():
+    global ACTIVO
+    while True:
+        if ACTIVO and (time.time()-ULTIMO_MSG>INACT_MIN*60):
+            ACTIVO=False
+            push_event("💤 Sala en pausa por inactividad.")
+        time.sleep(30)
 
-async def on_videochat_ended(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if is_admin(update):
-        set_live(False)
+# ==== Handlers ====
+async def start_cmd(u:Update,c:ContextTypes.DEFAULT_TYPE):
+    await u.message.reply_text("🤖 Bot activo. Usa /donar para apoyar o escribe para chatear.")
 
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("⚠️ Error", exc_info=context.error)
-    push_event("⚠️ Error interno del bot")
+async def donar_cmd(u:Update,c:ContextTypes.DEFAULT_TYPE):
+    kb=[[InlineKeyboardButton("💖 5 €",callback_data="tip_5"),
+         InlineKeyboardButton("🎁 10 €",callback_data="tip_10"),
+         InlineKeyboardButton("⭐ 20 €",callback_data="tip_20")],
+        [InlineKeyboardButton("💶 Importe libre",callback_data="tip_custom")]]
+    await u.message.reply_text("Selecciona tu donación:",reply_markup=InlineKeyboardMarkup(kb))
 
-# ========= Run =========
-def run_web():
-    web.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+async def botones_cb(u:Update,c:ContextTypes.DEFAULT_TYPE):
+    query=u.callback_query;await query.answer()
+    data=query.data
+    usuario=u.effective_user.full_name
+    monto=0
+    if data=="tip_5":monto=5
+    elif data=="tip_10":monto=10
+    elif data=="tip_20":monto=20
+    elif data=="tip_custom":monto=random.choice([3,7,12])
+    txt=registrar_donacion(monto,usuario)
+    await query.message.reply_text(txt)
 
-def run_polling_sync():
-    if not TOKEN: raise SystemExit("Falta TELEGRAM_TOKEN en Environment")
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("live_on", live_on_cmd))
-    app.add_handler(CommandHandler("live_off", live_off_cmd))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, echo_msg))
-    app.add_handler(MessageHandler(filters.ChatType.CHANNEL & filters.TEXT, channel_post))
-    # En supergrupos (si los usas):
-    app.add_handler(MessageHandler(filters.StatusUpdate.VIDEO_CHAT_STARTED, on_videochat_started))
-    app.add_handler(MessageHandler(filters.StatusUpdate.VIDEO_CHAT_ENDED, on_videochat_ended))
-    app.add_error_handler(on_error)
-    log.info("🤖 Iniciando bot (IA + LIVE/IDLE)…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+async def texto(u:Update,c:ContextTypes.DEFAULT_TYPE):
+    global ACTIVO,ULTIMO_MSG
+    ACTIVO=True;ULTIMO_MSG=time.time()
+    user=u.effective_user.full_name
+    txt=u.message.text or ""
+    log.info("%s: %s",user,txt)
+    resp=await ia_responder(txt)
+    resp_trad=traducir(resp,src="auto",dest="de")  # ejemplo alemán
+    push_event(f"{user}: {txt}")
+    push_event(f"🤖 {resp}")
+    await u.message.reply_text(resp_trad)
 
-if __name__ == "__main__":
-    threading.Thread(target=run_web, daemon=True).start()
-    threading.Thread(target=auto_idle_watcher, daemon=True).start()
-    run_polling_sync()
+# ==== Run ====
+def run_web(): web.run(host="0.0.0.0",port=PORT,debug=False,use_reloader=False)
+
+def run_polling():
+    if not TOKEN: raise SystemExit("Falta TELEGRAM_TOKEN")
+    app=ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start",start_cmd))
+    app.add_handler(CommandHandler("donar",donar_cmd))
+    app.add_handler(CallbackQueryHandler(botones_cb))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND),texto))
+    log.info("🤖 Bot CosplayLive ejecutándose…")
+    app.run_polling(allowed_updates=Update.ALL_TYPES,drop_pending_updates=True)
+
+if __name__=="__main__":
+    threading.Thread(target=run_web,daemon=True).start()
+    threading.Thread(target=watcher,daemon=True).start()
+    run_polling()
