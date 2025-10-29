@@ -1,3 +1,5 @@
 flask==3.0.3
 python-telegram-bot>=20.8
 stripe==6.7.0
+deep-translator==1.11.4
+openai==1.52.0
