@@ -1,4 +1,4 @@
-# app.py — CosplayLive PRO: Overlay/mirror + Assistant + Stripe + SSE
+# app.py — CosplayLive ULTRA (Overlay + Assistant + Stripe + Editable Prices + i18n)
 # Requiere requirements.txt:
 # python-telegram-bot==20.8
 # Flask==3.0.3
@@ -6,13 +6,14 @@
 # deep-translator==1.11.4
 # Pillow==10.4.0
 
-import os, sys, threading, logging, queue, io, html
+import os, sys, threading, logging, queue, io, html, json
 from datetime import datetime, timedelta
+from typing import List, Dict, Any
 
 from flask import Flask, Response, request
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
-from telegram.constants import ParseMode, ChatType
+from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 import asyncio
@@ -39,20 +40,21 @@ log = logging.getLogger("cosplaylive")
 # ========= ENV =========
 TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 PORT = int(os.getenv("PORT", "10000"))
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()   # -100xxxxxxxxxx (canal o grupo destino)
-BASE_URL = os.getenv("BASE_URL", "")               # https://tuapp.onrender.com
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()            # -100xxxxxxxxxx
+BASE_URL = os.getenv("BASE_URL", "").strip()                # https://tuapp.onrender.com
 STRIPE_SK = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WH = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 CURRENCY = os.getenv("CURRENCY", "EUR")
 
-# Auto marketing
+# Marketing
 ANNOUNCE_EVERY_MIN = int(os.getenv("ANNOUNCE_EVERY_MIN", "5"))
 AUTO_MARKETING = os.getenv("AUTO_MARKETING", "on").lower() in ("1","on","true","yes")
-QUIET_HOURS = os.getenv("QUIET_HOURS", "")  # ej "02-08"
+QUIET_HOURS = os.getenv("QUIET_HOURS", "")
 
-# Modelo(s) para traducción dirigida
+# Control
+ADMIN_IDS = [s.strip() for s in os.getenv("ADMIN_IDS", "").split(",") if s.strip()]
 MODEL_USER_IDS = [s.strip() for s in os.getenv("MODEL_USER_IDS", "").split(",") if s.strip()]
-AUDIENCE_LANGS = [s.strip() for s in os.getenv("AUDIENCE_LANGS", "es,de").split(",") if s.strip()]
+DEFAULT_AUDIENCE_LANGS = [s.strip() for s in os.getenv("AUDIENCE_LANGS", "de,en,sv,pl,es").split(",") if s.strip()]
 
 if not TOKEN:
     raise SystemExit("⚠️ Falta TELEGRAM_TOKEN")
@@ -63,37 +65,168 @@ if not PIL_OK:
 
 stripe.api_key = STRIPE_SK
 
+# ========= RUTAS DE PERSISTENCIA =========
+DATA_DIR = "/mnt/data"  # persiste en Render/containers entre reinicios, no entre imágenes
+DATA_PATH = os.path.join(DATA_DIR, "data.json")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# ========= I18N =========
+SUPPORTED_LANGS = ["de","en","es","pl","sv"]
+GREETS = {
+    "de": {"hallo","hi","servus","moin","hey"},
+    "en": {"hello","hi","hey","sup"},
+    "es": {"hola","buenas","holi","hey"},
+    "pl": {"cześć","hej","siema"},
+    "sv": {"hej","tjena","hallå"}
+}
+# Textos fijos (mínimos). Llave -> traducciones
+I18N: Dict[str, Dict[str,str]] = {
+    "assistant.greet":
+        {"de":"🤖 *Assistent der Model*: Schreib deine Frage oder wähle unten.",
+         "en":"🤖 *Model’s assistant*: Type your request or use the buttons below.",
+         "es":"🤖 *Asistente de la modelo*: Escribe tu pedido o usa los botones.",
+         "pl":"🤖 *Asystent modelki*: Napisz prośbę albo użyj przycisków poniżej.",
+         "sv":"🤖 *Modellens assistent*: Skriv din förfrågan eller använd knapparna."},
+    "assistant.about":
+        {"de":"ℹ️ *Über das Model:* {bio}",
+         "en":"ℹ️ *About the model:* {bio}",
+         "es":"ℹ️ *Sobre la modelo:* {bio}",
+         "pl":"ℹ️ *O modelce:* {bio}",
+         "sv":"ℹ️ *Om modellen:* {bio}"},
+    "assistant.menu_title":
+        {"de":"✨ *Wunsch-/Trinkgeldmenü*",
+         "en":"✨ *Tip & Request Menu*",
+         "es":"✨ *Menú de apoyos y pedidos*",
+         "pl":"✨ *Menu napiwków i próśb*",
+         "sv":"✨ *Dricks- & önskemålmeny*"},
+    "assistant.cta":
+        {"de":"Zahl mit Karte, Apple/Google Pay oder lokalen Methoden (Stripe).",
+         "en":"Pay with card, Apple/Google Pay or local methods (Stripe).",
+         "es":"Paga con tarjeta, Apple/Google Pay o métodos locales (Stripe).",
+         "pl":"Płać kartą, Apple/Google Pay lub lokalnymi metodami (Stripe).",
+         "sv":"Betala med kort, Apple/Google Pay eller lokala metoder (Stripe)."},
+    "assistant.translation_from_model":
+        {"de":"🗣️ *Übersetzung vom Model:*",
+         "en":"🗣️ *Model’s translation:*",
+         "es":"🗣️ *Traducción de la modelo:*",
+         "pl":"🗣️ *Tłumaczenie od modelki:*",
+         "sv":"🗣️ *Modellens översättning:*"},
+    "assistant.translation_for_model":
+        {"de":"👥 *Übersetzung für das Model:*",
+         "en":"👥 *Translation for the model:*",
+         "es":"👥 *Traducción para la modelo:*",
+         "pl":"👥 *Tłumaczenie dla modelki:*",
+         "sv":"👥 *Översättning för modellen:*"},
+    "assistant.open_studio":
+        {"de":"🎛️ Studio: {url}",
+         "en":"🎛️ Studio: {url}",
+         "es":"🎛️ Studio: {url}",
+         "pl":"🎛️ Studio: {url}",
+         "sv":"🎛️ Studio: {url}"},
+    "overlay.on":{"de":"🟢 Overlay aktiviert","en":"🟢 Overlay ON","es":"🟢 Overlay activado","pl":"🟢 Overlay włączony","sv":"🟢 Overlay på"},
+    "overlay.off":{"de":"🔴 Overlay deaktiviert","en":"🔴 Overlay OFF","es":"🔴 Overlay desactivado","pl":"🔴 Overlay wyłączony","sv":"🔴 Overlay av"},
+    "menu.item":
+        {"de":"• {name} — *{amt}* {ccy}",
+         "en":"• {name} — *{amt}* {ccy}",
+         "es":"• {name} — *{amt}* {ccy}",
+         "pl":"• {name} — *{amt}* {ccy}",
+         "sv":"• {name} — *{amt}* {ccy}"},
+    "announce.header":
+        {"de":"🚀 *Show live:* nutze das Menü unten",
+         "en":"🚀 *Live show:* use the menu",
+         "es":"🚀 *Show en vivo:* usa el menú",
+         "pl":"🚀 *Na żywo:* użyj menu",
+         "sv":"🚀 *Liveshow:* använd menyn"},
+    "thanks.title":
+        {"de":"Danke {user}!","en":"Thanks {user}!","es":"¡Gracias {user}!","pl":"Dziękujemy {user}!","sv":"Tack {user}!"},
+    "thanks.subtitle":
+        {"de":"Support: {amount}","en":"Support: {amount}","es":"Apoyo: {amount}","pl":"Wsparcie: {amount}","sv":"Stöd: {amount}"},
+    "thanks.message":
+        {"de":"🎉 *Danke, {user}!* Du hast *{amount}* gespendet.\n_{memo}_",
+         "en":"🎉 *Thanks, {user}!* You supported with *{amount}*.\n_{memo}_",
+         "es":"🎉 *¡Gracias, {user}!* Has apoyado con *{amount}*.\n_{memo}_",
+         "pl":"🎉 *Dzięki, {user}!* Wsparłeś/aś *{amount}*.\n_{memo}_",
+         "sv":"🎉 *Tack, {user}!* Du stödde med *{amount}*.\n_{memo}_"},
+}
+
+def t(lang: str, key: str, **kw) -> str:
+    lang = (lang or "en").split("-")[0]
+    if lang not in SUPPORTED_LANGS: lang = "en"
+    val = I18N.get(key, {}).get(lang) or I18N.get(key, {}).get("en") or key
+    if kw:
+        try: val = val.format(**kw)
+        except Exception: pass
+    return val
+
+def detect_lang(text: str) -> str:
+    try:
+        code = GoogleTranslator(source="auto", target="en").detect(text)  # returns 'de','es',...
+        code = (code or "en").split("-")[0]
+    except Exception:
+        code = "en"
+    if code not in SUPPORTED_LANGS:
+        code = "en"
+    return code
+
 # ========= ESTADO =========
+LIVE_FORCED = True
 last_activity = datetime.utcnow() - timedelta(hours=1)
 last_ad = datetime.utcnow() - timedelta(hours=1)
-LIVE_FORCED = True  # comienza activo
-PRICE_MENU = [
-    ("💃 Baile", 3),
-    ("👗 Probar lencería", 10),
-    ("🙈 Topless", 5),
-    ("🎯 Meta grupal", 50),
-]
-ROTATION = [
-    "✨ *Menú de apoyos y pedidos* (elige un botón) ↓",
-    "🎯 *Meta grupal:* cuando lleguemos a 50 EUR desbloqueamos *show especial*.",
-    "💡 *Tip:* Puedes dejar un mensaje con tu pedido cuando apoyes.",
-    "🔥 *Gracias por apoyar el show!* Usa los botones para participar.",
-]
-_rot_idx = 0
 SUPPRESS_AFTER_DONATION_SEC = 90
-
-# Overlay ON/OFF (para /overlay y /liveview)
 OVERLAY_ENABLED = True
 
-# ========= COLAS DE EVENTOS (SSE) =========
-events_studio: "queue.Queue[str]" = queue.Queue(maxsize=300)   # /events (studio)
-events_overlay: "queue.Queue[str]" = queue.Queue(maxsize=600)  # /overlay-events (mirror público)
+# ========= CONFIG (persistente) =========
+DEFAULT_CONFIG = {
+    "prices": [  # lista de dicts {"name":..., "price": int}
+        {"name":"💃 Dance", "price":3},
+        {"name":"👗 Lingerie try-on", "price":10},
+        {"name":"🙈 Topless", "price":5},
+        {"name":"🎯 Group goal", "price":50},
+    ],
+    "bio": "Cosplay europe@DE/CH/SE/PL/ES. Shows y pedidos con menú dinámico.",
+    "audience_langs": DEFAULT_AUDIENCE_LANGS,  # para traducción dirigida
+    "rotation_texts": {
+        "de": ["✨ *Wunsch-/Trinkgeldmenü*", "🎯 *Gruppenziel:* bei 50 EUR spezieller Show", "💡 Tipp: Du kannst eine Nachricht in der Spende lassen.", "🔥 Danke für euren Support!"],
+        "en": ["✨ *Tip & Request Menu*", "🎯 *Group goal:* 50 EUR unlocks special show", "💡 Tip: Leave a message with your support.", "🔥 Thanks for supporting!"],
+        "es": ["✨ *Menú de apoyos y pedidos*", "🎯 *Meta grupal:* a 50 EUR desbloqueamos show especial", "💡 Tip: deja mensaje en tu apoyo.", "🔥 ¡Gracias por apoyar!"],
+        "pl": ["✨ *Menu napiwków i próśb*", "🎯 *Cel grupowy:* 50 EUR = specjalny show", "💡 Tip: dodaj wiadomość do wpłaty.", "🔥 Dzięki za wsparcie!"],
+        "sv": ["✨ *Dricks- & önskemålmeny*", "🎯 *Gruppmål:* 50 EUR = specialshow", "💡 Tips: lämna meddelande i din gåva.", "🔥 Tack för stödet!"],
+    }
+}
+
+def load_config() -> Dict[str, Any]:
+    if os.path.exists(DATA_PATH):
+        try:
+            with open(DATA_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+                # sane defaults:
+                if "prices" not in cfg: cfg["prices"] = DEFAULT_CONFIG["prices"]
+                if "bio" not in cfg: cfg["bio"] = DEFAULT_CONFIG["bio"]
+                if "audience_langs" not in cfg: cfg["audience_langs"] = DEFAULT_CONFIG["audience_langs"]
+                if "rotation_texts" not in cfg: cfg["rotation_texts"] = DEFAULT_CONFIG["rotation_texts"]
+                return cfg
+        except Exception as e:
+            log.error(f"load_config error: {e}")
+    save_config(DEFAULT_CONFIG)
+    return json.loads(json.dumps(DEFAULT_CONFIG))
+
+def save_config(cfg: Dict[str, Any]) -> None:
+    try:
+        with open(DATA_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.error(f"save_config error: {e}")
+
+CFG = load_config()
+
+# ========= COLAS SSE =========
+events_studio: "queue.Queue[str]" = queue.Queue(maxsize=300)
+events_overlay: "queue.Queue[str]" = queue.Queue(maxsize=600)
 
 def _push(q: "queue.Queue[str]", text: str):
     text = (text or "").replace("\n", " ").strip()
     if not text: return
-    try:
-        q.put_nowait(text)
+    try: q.put_nowait(text)
     except queue.Full:
         try: q.get_nowait()
         except queue.Empty: pass
@@ -109,9 +242,9 @@ web = Flask(__name__)
 
 @web.get("/")
 def home():
-    return "✅ CosplayLive PRO corriendo"
+    return "✅ CosplayLive ULTRA corriendo"
 
-# ---------- Studio (solo modelo, con sonido) ----------
+# ----- Studio (modelo) -----
 @web.get("/studio")
 def studio():
     return """
@@ -129,11 +262,10 @@ h1{font-weight:700} .muted{opacity:.7} a{color:#9bd}
 <audio id="ding"><source src="https://actions.google.com/sounds/v1/alarms/beep_short.ogg" type="audio/ogg"></audio>
 </div>
 <script>
-const box=document.getElementById('events'); const ding=document.getElementById('ding');
+const box=document.getElementById('events');const ding=document.getElementById('ding');
 const es=new EventSource('/events');
-es.onmessage=(e)=>{ const div=document.createElement('div'); div.className='event';
-div.textContent=e.data; box.prepend(div); try{ding.currentTime=0; ding.play();}catch(_){}};</script>
-</body></html>"""
+es.onmessage=(e)=>{const d=document.createElement('div');d.className='event';d.textContent=e.data;
+box.prepend(d);try{ding.currentTime=0;ding.play();}catch(_){}};</script></body></html>"""
 
 @web.get("/events")
 def sse_studio():
@@ -144,10 +276,9 @@ def sse_studio():
     headers = {"Cache-Control":"no-cache","Connection":"keep-alive","X-Accel-Buffering":"no"}
     return Response(stream(), mimetype="text/event-stream", headers=headers)
 
-# ---------- Overlay público (mirror) ----------
+# ----- Overlay público -----
 @web.get("/overlay")
 def overlay_only():
-    # Overlay puro (fondo transparente): útil para OBS o player externo con CSS overlay
     return """
 <!doctype html><html><head><meta charset="utf-8"><title>Overlay</title>
 <style>
@@ -156,23 +287,20 @@ html,body{background:rgba(0,0,0,0);margin:0;overflow:hidden}
 .msg{align-self:center;max-width:88vw;background:rgba(0,0,0,.55);color:#fff;border-radius:18px;padding:12px 18px;
 font:600 22px system-ui,Segoe UI,Roboto,Arial;box-shadow:0 8px 30px rgba(0,0,0,.45);animation:pop .25s ease-out}
 @keyframes pop{from{transform:scale(.95);opacity:.2}to{transform:scale(1);opacity:1}}
-.hidden{display:none}
 </style></head><body>
 <div id="stack"></div>
 <script>
-const st=document.getElementById('stack'); let on=true;
-const es=new EventSource('/overlay-events');
-es.onmessage=(e)=>{ if(!on) return; const div=document.createElement('div'); div.className='msg';
-div.textContent=e.data; st.append(div); setTimeout(()=>div.remove(), 12000); };
+const st=document.getElementById('stack'); const es=new EventSource('/overlay-events');
+es.onmessage=(e)=>{const div=document.createElement('div');div.className='msg';
+div.textContent=e.data; st.append(div); setTimeout(()=>div.remove(), 12000);};
 </script></body></html>
     """
 
 @web.get("/liveview")
 def liveview():
-    # Página con reproductor + overlay encima (si pones una URL HLS/MP4 en ?src=)
     src = request.args.get("src","")
     safe = html.escape(src)
-    video_html = f'<video id="v" src="{safe}" autoplay playsinline controls style="width:100%;height:auto;background:#000"></video>' if src else "<div style='background:#000;height:48vh;border-radius:14px'></div>"
+    video_html = f'<video src="{safe}" autoplay playsinline controls style="width:100%;height:auto;background:#000"></video>' if src else "<div style='background:#000;height:48vh;border-radius:14px'></div>"
     return f"""
 <!doctype html><html><head><meta charset="utf-8"><title>Live + Overlay</title>
 <meta name=viewport content="width=device-width, initial-scale=1">
@@ -190,22 +318,19 @@ font:600 22px system-ui,Segoe UI,Roboto,Arial;box-shadow:0 8px 30px rgba(0,0,0,.
 </style></head><body>
 <div class="wrap">
   <div class="bar">
-    <div>🔴 Vista pública con *mirror* del chat</div>
-    <div>
-      <button class="btn" id="toggle">Ocultar overlay</button>
-    </div>
+    <div>🔴 Vista pública con chat superpuesto</div>
+    <div><button class="btn" id="toggle">Ocultar overlay</button></div>
   </div>
   <div id="stage">{video_html}
     <div id="overlay"><div id="stack"></div></div>
   </div>
-  <p style="opacity:.75;margin-top:8px">Tip: agrega tu stream HLS/MP4 como <code>?src=URL</code>. El overlay funciona siempre, aunque no haya video embebido.</p>
 </div>
 <script>
 let on=true; const btn=document.getElementById('toggle'); const st=document.getElementById('stack');
-btn.onclick=()=>{{on=!on; btn.textContent= on? 'Ocultar overlay':'Mostrar overlay';}};
+btn.onclick=()=>{{on=!on; btn.textContent=on?'Ocultar overlay':'Mostrar overlay';}};
 const es=new EventSource('/overlay-events');
-es.onmessage=(e)=>{{ if(!on) return; const div=document.createElement('div'); div.className='msg';
-div.textContent=e.data; st.append(div); setTimeout(()=>div.remove(),12000); }};
+es.onmessage=(e)=>{{ if(!on) return; const d=document.createElement('div'); d.className='msg';
+d.textContent=e.data; st.append(d); setTimeout(()=>d.remove(),12000); }};
 </script></body></html>
     """
 
@@ -218,10 +343,9 @@ def sse_overlay():
     headers = {"Cache-Control":"no-cache","Connection":"keep-alive","X-Accel-Buffering":"no"}
     return Response(stream(), mimetype="text/event-stream", headers=headers)
 
-# ---------- Stripe: donaciones ----------
+# ----- Stripe / Donar -----
 def build_card(title: str, subtitle: str):
-    if not PIL_OK:
-        return None
+    if not PIL_OK: return None
     W,H = 1200,500
     img = Image.new("RGB",(W,H),(8,12,22))
     d = ImageDraw.Draw(img)
@@ -237,30 +361,32 @@ def build_card(title: str, subtitle: str):
         d.ellipse((40+x*22, 60+(x*11)%320, 50+x*22, 70+(x*11)%320), fill=(255,120+(x*3)%120,80))
     buf = io.BytesIO(); img.save(buf, format="PNG"); buf.seek(0); return buf
 
-def kb_donaciones() -> InlineKeyboardMarkup:
-    rows=[]
-    for name, price in PRICE_MENU:
+def kb_donaciones(lang: str) -> InlineKeyboardMarkup:
+    rows = []
+    for item in CFG["prices"]:
+        name = item["name"]; price = item["price"]
         rows.append([InlineKeyboardButton(f"{name} · {price} {CURRENCY}",
                                           url=f"{BASE_URL}/donar?amt={price}&c={CURRENCY}")])
-    rows.append([InlineKeyboardButton("💝 Donar libre", url=f"{BASE_URL}/donar")])
+    rows.append([InlineKeyboardButton("💝 " + {"de":"Freier Betrag","en":"Free amount","es":"Importe libre","pl":"Dowolna kwota","sv":"Valfritt belopp"}[lang],
+                                      url=f"{BASE_URL}/donar")])
     return InlineKeyboardMarkup(rows)
 
 @web.get("/donar")
 def donate_page():
     amt = request.args.get("amt","")
     ccy = request.args.get("c", CURRENCY)
-    title = "Apoyo CosplayLive"
+    title = "Support CosplayLive"
     if not STRIPE_SK or not BASE_URL:
         return "<b>Stripe no está configurado</b> (STRIPE_SECRET_KEY/BASE_URL)."
-    # Si llega con ?amt= -> Checkout directo
-    if amt.isdigit():
+    # checkout directo
+    if amt.isdigit() and int(amt) > 0:
         session = stripe.checkout.Session.create(
             mode="payment",
             line_items=[{
                 "price_data": {
                     "currency": ccy.lower(),
                     "product_data": {"name": title},
-                    "unit_amount": int(float(amt)*100),
+                    "unit_amount": int(float(amt) * 100),
                 },
                 "quantity": 1
             }],
@@ -270,18 +396,19 @@ def donate_page():
             allow_promotion_codes=True,
         )
         return f'<meta http-equiv="refresh" content="0;url={session.url}">'
-    # Donación libre: formulario simple
+    # formulario libre
+    options = "".join([f'<a href="/donar?amt={p["price"]}&c={ccy}">{html.escape(p["name"])} · {p["price"]} {ccy}</a><br>' for p in CFG["prices"]])
     return f"""
-<!doctype html><html><head><meta charset="utf-8"><title>Donar</title>
-<style>body{{font-family:system-ui;padding:20px}}</style></head><body>
-<h3>Elige un importe</h3>
+<!doctype html><html><head><meta charset="utf-8"><title>Donate</title>
+<style>body{{font-family:system-ui;padding:20px;max-width:640px;margin:auto}}</style></head><body>
+<h3>Choose amount</h3>
 <form method="get" action="/donar">
   <input type="hidden" name="c" value="{ccy}">
   <input name="amt" type="number" min="1" step="1" value="5" style="padding:8px"> {ccy}
-  <button type="submit" style="padding:8px 12px">Pagar</button>
+  <button type="submit" style="padding:8px 12px">Pay</button>
 </form>
-<p>O elige rápido:</p>
-{"".join([f'<a href="/donar?amt={p}&c={ccy}">{n} · {p} {ccy}</a><br>' for n,p in PRICE_MENU])}
+<p>Or quick select:</p>
+{options}
 </body></html>
     """
 
@@ -299,7 +426,7 @@ def stripe_webhook():
         metadata = sess.get("metadata") or {}
         amount = metadata.get("amount") or f"{(sess.get('amount_total') or 0)/100:.2f} {sess.get('currency','').upper()}"
         payer = (sess.get("customer_details") or {}).get("email","usuario")
-        memo = "¡Gracias por tu apoyo!"
+        memo = "Gracias por tu apoyo"
         try:
             app = telegram_app_singleton()
             app.create_task(celebrate(app.bot, int(CHANNEL_ID), payer, amount, memo))
@@ -308,137 +435,219 @@ def stripe_webhook():
         log.info(f"✅ Stripe: pago recibido — {amount}")
     return "ok", 200
 
-# ========= Telegram features =========
-async def announce_prices(bot, chat_id: int, prefix: str | None = None):
-    global last_ad, _rot_idx
-    header = prefix or ROTATION[_rot_idx % len(ROTATION)]; _rot_idx += 1
-    text = (f"{header}\n\n" + "\n".join([f"• {n} — *{p}* {CURRENCY}" for n,p in PRICE_MENU])
-            + "\n\nToca un botón para pagar con tarjeta/PayPal alternativos (Stripe muestra métodos locales).")
-    await bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_donaciones())
+# ========= TELEGRAM =========
+def _rot_text(lang_cycle: List[str]) -> str:
+    # rota textos por idiomas para anuncios
+    now_idx = int(datetime.utcnow().timestamp() // (ANNOUNCE_EVERY_MIN*60)) % len(lang_cycle)
+    lang = lang_cycle[now_idx]
+    arr = CFG["rotation_texts"].get(lang) or CFG["rotation_texts"]["en"]
+    return (arr[now_idx % len(arr)]), lang
+
+async def announce_prices(bot, chat_id: int, lang_hint: str | None = None):
+    global last_ad
+    # rotamos por audiencias si no hay pista
+    lang_cycle = CFG.get("audience_langs") or DEFAULT_AUDIENCE_LANGS
+    lang = (lang_hint or (lang_cycle[0] if lang_cycle else "en")).split("-")[0]
+    if lang not in SUPPORTED_LANGS: lang = "en"
+    header, chosen_lang = _rot_text(lang_cycle)
+    # construir texto de menú
+    items = "\n".join([t(chosen_lang, "menu.item", name=p["name"], amt=p["price"], ccy=CURRENCY) for p in CFG["prices"]])
+    text = f"{header}\n\n{items}\n\n{t(chosen_lang,'assistant.cta')}"
+    await bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_donaciones(chosen_lang))
     last_ad = datetime.utcnow()
 
 async def celebrate(bot, chat_id: int, user: str, amount: str, memo: str):
     global last_activity, last_ad
-    txt = f"🎉 *¡Gracias, {user}!*\nHas apoyado con *{amount}*.\n_{memo or '¡A tope con el show!'}_"
-    msg = await bot.send_message(chat_id, txt, parse_mode=ParseMode.MARKDOWN)
+    # idioma base alemán para canal; puedes cambiar a "en"
+    lang = "de"
+    msg = await bot.send_message(chat_id, t(lang,"thanks.message", user=user, amount=amount, memo=memo), parse_mode=ParseMode.MARKDOWN)
+    # pin temporal
     try:
         await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
         await asyncio.sleep(15); await bot.unpin_chat_message(chat_id, msg.message_id)
     except Exception as e:
         log.info(f"Pin opcional: {e}")
+    # título temporal
     try:
         old = (await bot.get_chat(chat_id)).title or ""
-        new = f"🔥 Gracias {user} ({amount})"
-        await bot.set_chat_title(chat_id, new)
-        await asyncio.sleep(15); await bot.set_chat_title(chat_id, old)
+        new = f"🔥 {t(lang,'thanks.title', user=user)} ({amount})"
+        await bot.set_chat_title(chat_id, new); await asyncio.sleep(15); await bot.set_chat_title(chat_id, old)
     except Exception as e:
         log.info(f"Título opcional: {e}")
-    buf = build_card(f"¡Gracias {user}!", f"Apoyo: {amount}")
+    # tarjeta gráfica
+    buf = build_card(t(lang,'thanks.title', user=user), t(lang,'thanks.subtitle', amount=amount))
     if buf: await bot.send_photo(chat_id, photo=InputFile(buf, filename="thanks.png"))
-    else:   await bot.send_message(chat_id, "🖼️ (Tarjeta gráfica desactivada temporalmente)")
-    # Avisos
-    push_studio(f"🎉 Donación: {user} → {amount} | {memo or ''}")
+    push_studio(f"🎉 Donación: {user} → {amount}")
     push_overlay(f"🎉 {user}: {amount}")
-    # Pausa anuncios
     last_activity = datetime.utcnow(); last_ad = datetime.utcnow()
 
-# --- Assistant triggers ---
-GREET_WORDS = {"hola","hello","hi","hallo","servus","hey","buenas","holi"}
-ASSISTANT_REPLY = ("🤖 *Asistente de la modelo*: escribe tu pedido o pregunta.\n"
-                   "Puedo traducir tus mensajes y darte info del menú con /menu o /precios.")
+# ---- Comandos de admin (editar menú, bio, idiomas) ----
+def is_admin(user_id: int) -> bool:
+    return (str(user_id) in ADMIN_IDS) or (str(user_id) in MODEL_USER_IDS)
 
-def _language_auto_detect(text: str) -> str:
+async def addprice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Uso: /addprice <importe> <nombre>")
+        return
     try:
-        return GoogleTranslator(source="auto", target="en").detect(text)
+        amt = int(context.args[0])
+        name = " ".join(context.args[1:]).strip()
+        if amt <= 0 or not name: raise ValueError()
+        CFG["prices"].append({"name":name, "price":amt})
+        save_config(CFG)
+        await update.message.reply_text(f"✅ Añadido: {name} · {amt} {CURRENCY}")
     except Exception:
-        return "auto"
+        await update.message.reply_text("Formato inválido. Ej: /addprice 3 Beso")
 
+async def delprice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return
+    if not context.args:
+        await update.message.reply_text("Uso: /delprice <índice|nombre>")
+        return
+    arg = " ".join(context.args).strip()
+    removed = None
+    # por índice
+    if arg.isdigit():
+        idx = int(arg)-1
+        if 0 <= idx < len(CFG["prices"]):
+            removed = CFG["prices"].pop(idx)
+    else:
+        for i,p in enumerate(CFG["prices"]):
+            if p["name"].lower() == arg.lower():
+                removed = CFG["prices"].pop(i); break
+    if removed:
+        save_config(CFG)
+        await update.message.reply_text(f"🗑️ Eliminado: {removed['name']}")
+    else:
+        await update.message.reply_text("No encontrado.")
+
+async def listprices_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = []
+    for i,p in enumerate(CFG["prices"], start=1):
+        lines.append(f"{i}. {p['name']} · {p['price']} {CURRENCY}")
+    await update.message.reply_text("Precios actuales:\n" + "\n".join(lines))
+
+async def setlangs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return
+    if not context.args:
+        await update.message.reply_text("Uso: /setlangs de,en,sv,pl,es")
+        return
+    arr = " ".join(context.args).replace(" ","").split(",")
+    arr = [x for x in arr if x in SUPPORTED_LANGS]
+    if not arr:
+        await update.message.reply_text("Idiomas no válidos.")
+        return
+    CFG["audience_langs"] = arr; save_config(CFG)
+    await update.message.reply_text("✅ Idiomas de traducción: " + ",".join(arr))
+
+async def setbio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return
+    text = (update.message.text or "").split(" ",1)
+    if len(text) < 2 or not text[1].strip():
+        await update.message.reply_text("Uso: /setbio <texto>")
+        return
+    CFG["bio"] = text[1].strip(); save_config(CFG)
+    await update.message.reply_text("✅ Bio actualizada.")
+
+async def exportconfig_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return
+    data = json.dumps(CFG, ensure_ascii=False, indent=2).encode("utf-8")
+    await update.message.reply_document(document=InputFile(io.BytesIO(data), filename="data.json"))
+
+# ---- Otros comandos ----
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    await update.message.reply_text(
-        "🤖 ¡Bot activo! Usa /menu para donaciones o /precios.\n/studio (modelo) • /overlay (OBS) • /liveview (público).")
-    if chat and str(chat.id) == str(CHANNEL_ID):
-        await announce_prices(context.bot, chat.id, prefix="🚀 *Show en vivo:* usa el menú para participar")
+    await update.message.reply_text("🤖 Bot listo. /menu /precios /studio /overlay /liveview /addprice /delprice /listprices /setbio /setlangs")
 
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("💝 Opciones de apoyo:", reply_markup=kb_donaciones())
+    # idioma del usuario
+    txt = update.message.text or ""
+    lang = detect_lang(txt)
+    text = t(lang,"assistant.greet") + "\n" + t(lang,"assistant.about", bio=CFG["bio"])
+    items = "\n".join([t(lang,"menu.item", name=p["name"], amt=p["price"], ccy=CURRENCY) for p in CFG["prices"]])
+    text += "\n\n" + t(lang,"assistant.menu_title") + "\n\n" + items + "\n\n" + t(lang,"assistant.cta")
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_donaciones(lang))
 
 async def precios_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await announce_prices(context.bot, update.effective_chat.id)
+    await menu_cmd(update, context)
 
 async def studio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🎛️ Abre tu panel: {BASE_URL}/studio")
+    await update.message.reply_text(t("en","assistant.open_studio", url=f"{BASE_URL}/studio"))
 
 async def overlay_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global OVERLAY_ENABLED; OVERLAY_ENABLED=True
-    await update.message.reply_text("🟢 Overlay activado")
+    await update.message.reply_text(t("es","overlay.on"))
 
 async def overlay_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global OVERLAY_ENABLED; OVERLAY_ENABLED=False
-    await update.message.reply_text("🔴 Overlay desactivado")
+    await update.message.reply_text(t("es","overlay.off"))
 
 async def liveon(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global LIVE_FORCED; LIVE_FORCED=True
-    await update.message.reply_text("🟢 Marketing automático ACTIVADO")
+    await update.message.reply_text("🟢 Marketing ON")
 
 async def liveoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global LIVE_FORCED; LIVE_FORCED=False
-    await update.message.reply_text("🔴 Marketing automático PAUSADO")
+    await update.message.reply_text("🔴 Marketing OFF")
 
-# --- Mensajes en PRIVADOS/GRUPOS: asistente + traducción dirigida + mirror overlay ---
+# ---- Mensajes en grupos/canales: asistente + mirror + traducción dirigida ----
+def _is_greet(text: str) -> bool:
+    low = text.lower().strip()
+    for s in GREETS.values():
+        if low in s: return True
+    return False
+
 async def group_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_activity
-    last_activity = datetime.utcnow()
     msg = update.message
     if not msg or not msg.text: return
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    name = user.full_name if user else "User"
     text = msg.text.strip()
-    author = update.effective_user
-    author_id = str(author.id) if author else ""
-    name = author.full_name if author else "Usuario"
+    last_activity = datetime.utcnow()
 
-    # 1) Mirror al overlay (público) si estamos en el canal/grupo objetivo
+    # mirror al overlay (solo si estamos en el canal/grupo objetivo)
     try:
-        if str(update.effective_chat.id) == str(CHANNEL_ID):
-            # Evitar espejear mensajes del propio bot
-            if not (author and author.is_bot):
-                push_overlay(f"{name}: {text}")
+        if str(chat_id) == str(CHANNEL_ID) and not (user and user.is_bot):
+            push_overlay(f"{name}: {text}")
     except Exception as e:
         log.info(f"overlay mirror: {e}")
 
-    # 2) Respuesta asistente básica a saludos
-    if text.lower() in GREET_WORDS:
-        await msg.reply_text(ASSISTANT_REPLY, parse_mode=ParseMode.MARKDOWN)
+    # asistente a saludos
+    if _is_greet(text):
+        lang = detect_lang(text)
+        response = t(lang,"assistant.greet") + "\n" + t(lang,"assistant.about", bio=CFG["bio"])
+        await msg.reply_text(response, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_donaciones(lang))
+        return
 
-    # 3) Traducción dirigida
+    # traducción dirigida
     try:
-        if author_id and author_id in MODEL_USER_IDS:
-            # Mensaje de la modelo -> traducir al público (idiomas AUDIENCE_LANGS)
-            parts=[]
-            for lang in AUDIENCE_LANGS:
-                tr = GoogleTranslator(source="auto", target=lang).translate(text)
-                parts.append(f"{lang.upper()}: {tr}")
-            await msg.reply_text("🗣️ Traducción de la modelo:\n" + "\n".join(parts))
+        langs = CFG.get("audience_langs") or DEFAULT_AUDIENCE_LANGS
+        if str(user.id) in MODEL_USER_IDS:
+            # modelo → traducción para público
+            parts = []
+            for L in langs:
+                tr = GoogleTranslator(source="auto", target=L).translate(text)
+                parts.append(f"{L.upper()}: {tr}")
+            await msg.reply_text(t("en","assistant.translation_from_model") + "\n" + "\n".join(parts))
         else:
-            # Mensaje de usuario -> traducir para la modelo (ES y DE por defecto)
-            parts=[]
-            for lang in AUDIENCE_LANGS:
-                tr = GoogleTranslator(source="auto", target=lang).translate(text)
-                parts.append(f"{lang.upper()}: {tr}")
-            await msg.reply_text("👥 Traducción para la modelo:\n" + "\n".join(parts))
+            # usuario → traducción para la modelo
+            parts = []
+            for L in langs:
+                tr = GoogleTranslator(source="auto", target=L).translate(text)
+                parts.append(f"{L.upper()}: {tr}")
+            await msg.reply_text(t("en","assistant.translation_for_model") + "\n" + "\n".join(parts))
     except Exception as e:
         log.info(f"translate fail: {e}")
 
-# --- Mensajes del canal (posts) -> actualizar actividad y rotación de anuncios ---
 async def channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_activity
     last_activity = datetime.utcnow()
     post = update.channel_post
     if not post: return
-    # Mirror al overlay también
-    try:
-        if post.text:
-            push_overlay(f"📢 Canal: {post.text}")
-    except Exception: pass
+    if post.text:
+        push_overlay(f"📢 {post.text}")
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("❌ Handler error", exc_info=context.error)
@@ -450,8 +659,10 @@ def _in_quiet_hours(now_utc: datetime) -> bool:
         start_s, end_s = QUIET_HOURS.split("-")
         start_h, end_h = int(start_s), int(end_s)
         h = now_utc.hour
-        if start_h <= end_h:  return start_h <= h < end_h
-        else:                 return h >= start_h or h < end_h
+        if start_h <= end_h:
+            return start_h <= h < end_h
+        else:
+            return h >= start_h or h < end_h
     except Exception:
         return False
 
@@ -480,15 +691,13 @@ _app_singleton = None
 def telegram_app_singleton():
     global _app_singleton
     if _app_singleton: return _app_singleton
-
     _app_singleton = (
         ApplicationBuilder()
         .token(TOKEN)
         .post_init(on_startup)
         .build()
     )
-
-    # Comandos
+    # comandos
     _app_singleton.add_handler(CommandHandler("start", start_cmd))
     _app_singleton.add_handler(CommandHandler("menu", menu_cmd))
     _app_singleton.add_handler(CommandHandler("precios", precios_cmd))
@@ -497,16 +706,16 @@ def telegram_app_singleton():
     _app_singleton.add_handler(CommandHandler("overlayoff", overlay_off))
     _app_singleton.add_handler(CommandHandler("liveon", liveon))
     _app_singleton.add_handler(CommandHandler("liveoff", liveoff))
-
-    # Mensajes en grupos/supergrupos/canales (no-bot)
-    _app_singleton.add_handler(MessageHandler(
-        (filters.TEXT & (~filters.ChatType.PRIVATE)),
-        group_msg
-    ))
-
-    # Posts del canal
+    _app_singleton.add_handler(CommandHandler("addprice", addprice_cmd))
+    _app_singleton.add_handler(CommandHandler("delprice", delprice_cmd))
+    _app_singleton.add_handler(CommandHandler("listprices", listprices_cmd))
+    _app_singleton.add_handler(CommandHandler("setlangs", setlangs_cmd))
+    _app_singleton.add_handler(CommandHandler("setbio", setbio_cmd))
+    _app_singleton.add_handler(CommandHandler("exportconfig", exportconfig_cmd))
+    # mensajes en grupos/supergrupos/canales (texto)
+    _app_singleton.add_handler(MessageHandler(filters.TEXT & (~filters.ChatType.PRIVATE), group_msg))
+    # posts del canal
     _app_singleton.add_handler(MessageHandler(filters.ChatType.CHANNEL, channel_post))
-
     _app_singleton.add_error_handler(on_error)
     return _app_singleton
 
