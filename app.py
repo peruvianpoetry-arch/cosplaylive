@@ -1,4 +1,4 @@
-# app.py — CosplayLive ULTRA (Overlay + Assistant + Stripe + Editable Prices + i18n)
+# app.py — CosplayLive ULTRA (LIVE-aware marketing + Studio mirror + Stripe + i18n)
 # Requiere requirements.txt:
 # python-telegram-bot==20.8
 # Flask==3.0.3
@@ -12,9 +12,13 @@ from typing import List, Dict, Any
 
 from flask import Flask, Response, request
 
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
+from telegram import (
+    Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
+)
 from telegram.constants import ParseMode
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+)
 
 import asyncio
 import stripe
@@ -40,16 +44,14 @@ log = logging.getLogger("cosplaylive")
 # ========= ENV =========
 TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 PORT = int(os.getenv("PORT", "10000"))
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()            # -100xxxxxxxxxx
-BASE_URL = os.getenv("BASE_URL", "").strip()                # https://tuapp.onrender.com
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()                  # -100xxxxxxxxxx
+BASE_URL = os.getenv("BASE_URL", "").strip()                      # https://tuapp.onrender.com
 STRIPE_SK = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WH = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 CURRENCY = os.getenv("CURRENCY", "EUR")
 
-# Marketing
+# Marketing (solo cuando LIVE_ACTIVE=True)
 ANNOUNCE_EVERY_MIN = int(os.getenv("ANNOUNCE_EVERY_MIN", "5"))
-AUTO_MARKETING = os.getenv("AUTO_MARKETING", "on").lower() in ("1","on","true","yes")
-QUIET_HOURS = os.getenv("QUIET_HOURS", "")
 
 # Control
 ADMIN_IDS = [s.strip() for s in os.getenv("ADMIN_IDS", "").split(",") if s.strip()]
@@ -65,9 +67,7 @@ if not PIL_OK:
 
 stripe.api_key = STRIPE_SK
 
-# ========= RUTAS DE PERSISTENCIA =========
-# Si tienes un Disk en Render, define DATA_DIR=/var/data en Environment.
-# Si no, usamos /tmp (escribible siempre).
+# ========= PERSISTENCIA =========
 DATA_DIR = os.getenv("DATA_DIR", "/tmp/cosplaylive")
 os.makedirs(DATA_DIR, exist_ok=True)
 DATA_PATH = os.path.join(DATA_DIR, "data.json")
@@ -133,7 +133,7 @@ I18N: Dict[str, Dict[str,str]] = {
          "pl":"• {name} — *{amt}* {ccy}",
          "sv":"• {name} — *{amt}* {ccy}"},
     "announce.header":
-        {"de":"🚀 *Show live:* nutze das Menü unten",
+        {"de":"🚀 *Live-Show:* nutze das Menü",
          "en":"🚀 *Live show:* use the menu",
          "es":"🚀 *Show en vivo:* usa el menú",
          "pl":"🚀 *Na żywo:* użyj menu",
@@ -170,13 +170,13 @@ def detect_lang(text: str) -> str:
     return code
 
 # ========= ESTADO =========
-LIVE_FORCED = True
+LIVE_ACTIVE = False              # << SOLO si True habrá anuncios
 last_activity = datetime.utcnow() - timedelta(hours=1)
 last_ad = datetime.utcnow() - timedelta(hours=1)
 SUPPRESS_AFTER_DONATION_SEC = 90
 OVERLAY_ENABLED = True
 
-# ========= CONFIG (persistente) =========
+# ========= CONFIG =========
 DEFAULT_CONFIG = {
     "prices": [
         {"name":"💃 Dance", "price":3},
@@ -187,11 +187,11 @@ DEFAULT_CONFIG = {
     "bio": "Cosplay europe@DE/CH/SE/PL/ES. Shows y pedidos con menú dinámico.",
     "audience_langs": DEFAULT_AUDIENCE_LANGS,
     "rotation_texts": {
-        "de": ["✨ *Wunsch-/Trinkgeldmenü*", "🎯 *Gruppenziel:* bei 50 EUR spezieller Show", "💡 Tipp: Du kannst eine Nachricht in der Spende lassen.", "🔥 Danke für euren Support!"],
-        "en": ["✨ *Tip & Request Menu*", "🎯 *Group goal:* 50 EUR unlocks special show", "💡 Tip: Leave a message with your support.", "🔥 Thanks for supporting!"],
-        "es": ["✨ *Menú de apoyos y pedidos*", "🎯 *Meta grupal:* a 50 EUR desbloqueamos show especial", "💡 Tip: deja mensaje en tu apoyo.", "🔥 ¡Gracias por apoyar!"],
-        "pl": ["✨ *Menu napiwków i próśb*", "🎯 *Cel grupowy:* 50 EUR = specjalny show", "💡 Tip: dodaj wiadomość do wpłaty.", "🔥 Dzięki za wsparcie!"],
-        "sv": ["✨ *Dricks- & önskemålmeny*", "🎯 *Gruppmål:* 50 EUR = specialshow", "💡 Tips: lämna meddelande i din gåva.", "🔥 Tack för stödet!"],
+        "de": ["✨ *Wunsch-/Trinkgeldmenü*", "🎯 *Gruppenziel:* bei 50 EUR spezieller Show", "💡 Tipp: Nachricht bei Spende!", "🔥 Danke für euren Support!"],
+        "en": ["✨ *Tip & Request Menu*", "🎯 *Group goal:* 50 EUR unlocks special show", "💡 Tip: Leave a message!", "🔥 Thanks for supporting!"],
+        "es": ["✨ *Menú de apoyos y pedidos*", "🎯 *Meta grupal:* 50 EUR = show especial", "💡 Tip: deja un mensaje!", "🔥 ¡Gracias por apoyar!"],
+        "pl": ["✨ *Menu napiwków i próśb*", "🎯 *Cel grupowy:* 50 EUR = special show", "💡 Tip: dodaj wiadomość!", "🔥 Dzięki za wsparcie!"],
+        "sv": ["✨ *Dricks- & önskemålmeny*", "🎯 *Gruppmål:* 50 EUR = specialshow", "💡 Tips: lämna meddelande!", "🔥 Tack för stödet!"],
     }
 }
 
@@ -200,10 +200,8 @@ def load_config() -> Dict[str, Any]:
         try:
             with open(DATA_PATH, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
-                if "prices" not in cfg: cfg["prices"] = DEFAULT_CONFIG["prices"]
-                if "bio" not in cfg: cfg["bio"] = DEFAULT_CONFIG["bio"]
-                if "audience_langs" not in cfg: cfg["audience_langs"] = DEFAULT_CONFIG["audience_langs"]
-                if "rotation_texts" not in cfg: cfg["rotation_texts"] = DEFAULT_CONFIG["rotation_texts"]
+                for k,v in DEFAULT_CONFIG.items():
+                    if k not in cfg: cfg[k] = v
                 return cfg
         except Exception as e:
             log.error(f"load_config error: {e}")
@@ -244,7 +242,26 @@ web = Flask(__name__)
 def home():
     return "✅ CosplayLive ULTRA corriendo"
 
-# ----- Studio (modelo) -----
+# Páginas Stripe OK / CANCEL (evita 404)
+@web.get("/ok")
+def ok_page():
+    return """
+<!doctype html><html><head><meta charset="utf-8"><title>Pago OK</title>
+<style>body{font-family:system-ui;padding:24px}</style></head><body>
+<h2>✅ Pago recibido (modo test)</h2>
+<p>Ya puedes volver a Telegram. En unos segundos verás el anuncio en el canal.</p>
+</body></html>"""
+
+@web.get("/cancel")
+def cancel_page():
+    return """
+<!doctype html><html><head><meta charset="utf-8"><title>Pago cancelado</title>
+<style>body{font-family:system-ui;padding:24px}</style></head><body>
+<h2>❌ Pago cancelado</h2>
+<p>Puedes intentarlo de nuevo cuando quieras.</p>
+</body></html>"""
+
+# Studio (modelo)
 @web.get("/studio")
 def studio():
     return """
@@ -254,7 +271,7 @@ body{font-family:system-ui,Segoe UI,Roboto,Arial;background:#0b0f17;color:#fff;m
 #wrap{max-width:940px;margin:0 auto;padding:16px}
 .event{background:#121b2e;border-radius:14px;padding:14px;margin:10px 0;
 box-shadow:0 6px 24px rgba(0,0,0,.35);font-size:20px}
-h1{font-weight:700} .muted{opacity:.7} a{color:#9bd}
+h1{font-weight:700} .muted{opacity:.7}
 </style></head><body><div id="wrap">
 <h1>👩‍🎤 Cosplay Studio</h1>
 <p class="muted">Mantén esta página abierta. Sonará y mostrará avisos cuando haya donaciones o pedidos.</p>
@@ -262,10 +279,10 @@ h1{font-weight:700} .muted{opacity:.7} a{color:#9bd}
 <audio id="ding"><source src="https://actions.google.com/sounds/v1/alarms/beep_short.ogg" type="audio/ogg"></audio>
 </div>
 <script>
-const box=document.getElementById('events');const ding=document.getElementById('ding');
+const box=document.getElementById('events'); const ding=document.getElementById('ding');
 const es=new EventSource('/events');
-es.onmessage=(e)=>{const d=document.createElement('div');d.className='event';d.textContent=e.data;
-box.prepend(d);try{ding.currentTime=0;ding.play();}catch(_){}};</script></body></html>"""
+es.onmessage=(e)=>{const d=document.createElement('div'); d.className='event'; d.textContent=e.data;
+box.prepend(d); try{ding.currentTime=0; ding.play();}catch(_){}}</script></body></html>"""
 
 @web.get("/events")
 def sse_studio():
@@ -276,7 +293,7 @@ def sse_studio():
     headers = {"Cache-Control":"no-cache","Connection":"keep-alive","X-Accel-Buffering":"no"}
     return Response(stream(), mimetype="text/event-stream", headers=headers)
 
-# ----- Overlay público -----
+# Overlay público
 @web.get("/overlay")
 def overlay_only():
     return """
@@ -291,10 +308,9 @@ font:600 22px system-ui,Segoe UI,Roboto,Arial;box-shadow:0 8px 30px rgba(0,0,0,.
 <div id="stack"></div>
 <script>
 const st=document.getElementById('stack'); const es=new EventSource('/overlay-events');
-es.onmessage=(e)=>{const div=document.createElement('div');div.className='msg';
-div.textContent=e.data; st.append(div); setTimeout(()=>div.remove(), 12000);};
-</script></body></html>
-    """
+es.onmessage=(e)=>{const d=document.createElement('div'); d.className='msg';
+d.textContent=e.data; st.append(d); setTimeout(()=>d.remove(), 12000);};
+</script></body></html>"""
 
 @web.get("/liveview")
 def liveview():
@@ -331,8 +347,7 @@ btn.onclick=()=>{{on=!on; btn.textContent=on?'Ocultar overlay':'Mostrar overlay'
 const es=new EventSource('/overlay-events');
 es.onmessage=(e)=>{{ if(!on) return; const d=document.createElement('div'); d.className='msg';
 d.textContent=e.data; st.append(d); setTimeout(()=>d.remove(),12000); }};
-</script></body></html>
-    """
+</script></body></html>"""
 
 @web.get("/overlay-events")
 def sse_overlay():
@@ -407,8 +422,7 @@ def donate_page():
 </form>
 <p>Or quick select:</p>
 {options}
-</body></html>
-    """
+</body></html>"""
 
 @web.post("/stripe/webhook")
 def stripe_webhook():
@@ -472,21 +486,18 @@ async def celebrate(bot, chat_id: int, user: str, amount: str, memo: str):
     push_overlay(f"🎉 {user}: {amount}")
     last_activity = datetime.utcnow(); last_ad = datetime.utcnow()
 
-# ---- Comandos de admin ----
+# ---- Admin ----
 def is_admin(user_id: int) -> bool:
     return (str(user_id) in ADMIN_IDS) or (str(user_id) in MODEL_USER_IDS)
 
 async def addprice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     if not context.args or len(context.args) < 2:
-        await update.message.reply_text("Uso: /addprice <importe> <nombre>")
-        return
+        await update.message.reply_text("Uso: /addprice <importe> <nombre>"); return
     try:
-        amt = int(context.args[0])
-        name = " ".join(context.args[1:]).strip()
+        amt = int(context.args[0]); name = " ".join(context.args[1:]).strip()
         if amt <= 0 or not name: raise ValueError()
-        CFG["prices"].append({"name":name, "price":amt})
-        save_config(CFG)
+        CFG["prices"].append({"name":name, "price":amt}); save_config(CFG)
         await update.message.reply_text(f"✅ Añadido: {name} · {amt} {CURRENCY}")
     except Exception:
         await update.message.reply_text("Formato inválido. Ej: /addprice 3 Beso")
@@ -494,40 +505,32 @@ async def addprice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def delprice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     if not context.args:
-        await update.message.reply_text("Uso: /delprice <índice|nombre>")
-        return
+        await update.message.reply_text("Uso: /delprice <índice|nombre>"); return
     arg = " ".join(context.args).strip()
     removed = None
     if arg.isdigit():
         idx = int(arg)-1
-        if 0 <= idx < len(CFG["prices"]):
-            removed = CFG["prices"].pop(idx)
+        if 0 <= idx < len(CFG["prices"]): removed = CFG["prices"].pop(idx)
     else:
         for i,p in enumerate(CFG["prices"]):
             if p["name"].lower() == arg.lower():
                 removed = CFG["prices"].pop(i); break
     if removed:
-        save_config(CFG)
-        await update.message.reply_text(f"🗑️ Eliminado: {removed['name']}")
+        save_config(CFG); await update.message.reply_text(f"🗑️ Eliminado: {removed['name']}")
     else:
         await update.message.reply_text("No encontrado.")
 
 async def listprices_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lines = []
-    for i,p in enumerate(CFG["prices"], start=1):
-        lines.append(f"{i}. {p['name']} · {p['price']} {CURRENCY}")
+    lines = [f"{i}. {p['name']} · {p['price']} {CURRENCY}" for i,p in enumerate(CFG["prices"], start=1)]
     await update.message.reply_text("Precios actuales:\n" + "\n".join(lines))
 
 async def setlangs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     if not context.args:
-        await update.message.reply_text("Uso: /setlangs de,en,sv,pl,es")
-        return
+        await update.message.reply_text("Uso: /setlangs de,en,sv,pl,es"); return
     arr = " ".join(context.args).replace(" ","").split(",")
     arr = [x for x in arr if x in SUPPORTED_LANGS]
-    if not arr:
-        await update.message.reply_text("Idiomas no válidos.")
-        return
+    if not arr: await update.message.reply_text("Idiomas no válidos."); return
     CFG["audience_langs"] = arr; save_config(CFG)
     await update.message.reply_text("✅ Idiomas de traducción: " + ",".join(arr))
 
@@ -535,8 +538,7 @@ async def setbio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     text = (update.message.text or "").split(" ",1)
     if len(text) < 2 or not text[1].strip():
-        await update.message.reply_text("Uso: /setbio <texto>")
-        return
+        await update.message.reply_text("Uso: /setbio <texto>"); return
     CFG["bio"] = text[1].strip(); save_config(CFG)
     await update.message.reply_text("✅ Bio actualizada.")
 
@@ -545,9 +547,23 @@ async def exportconfig_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = json.dumps(CFG, ensure_ascii=False, indent=2).encode("utf-8")
     await update.message.reply_document(document=InputFile(io.BytesIO(data), filename="data.json"))
 
+# ---- Estado / live ----
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"LIVE_ACTIVE={LIVE_ACTIVE}, anuncios cada {ANNOUNCE_EVERY_MIN} min, overlay={'on' if OVERLAY_ENABLED else 'off'}")
+
+async def golive_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global LIVE_ACTIVE
+    LIVE_ACTIVE = True
+    await update.message.reply_text("🟢 LIVE detectado (manual). Marketing ACTIVADO.")
+
+async def endlive_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global LIVE_ACTIVE
+    LIVE_ACTIVE = False
+    await update.message.reply_text("🔴 LIVE finalizado (manual). Marketing pausado.")
+
 # ---- Otros comandos ----
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Bot listo. /menu /precios /studio /overlay /liveview /addprice /delprice /listprices /setbio /setlangs")
+    await update.message.reply_text("🤖 Listo. /menu /precios /studio /overlay /liveview /addprice /delprice /listprices /setbio /setlangs /status /golive /endlive")
 
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text or ""
@@ -560,9 +576,7 @@ async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def precios_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await menu_cmd(update, context)
 
-async def studio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(t("en","assistant.open_studio", url=f"{BASE_URL}/studio"))
-
+# Overlay toggles
 async def overlay_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global OVERLAY_ENABLED; OVERLAY_ENABLED=True
     await update.message.reply_text(t("es","overlay.on"))
@@ -570,14 +584,6 @@ async def overlay_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def overlay_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global OVERLAY_ENABLED; OVERLAY_ENABLED=False
     await update.message.reply_text(t("es","overlay.off"))
-
-async def liveon(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global LIVE_FORCED; LIVE_FORCED=True
-    await update.message.reply_text("🟢 Marketing ON")
-
-async def liveoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global LIVE_FORCED; LIVE_FORCED=False
-    await update.message.reply_text("🔴 Marketing OFF")
 
 # ---- Mensajes en grupos/canales ----
 def _is_greet(text: str) -> bool:
@@ -596,11 +602,13 @@ async def group_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = msg.text.strip()
     last_activity = datetime.utcnow()
 
+    # espejo a overlay y Studio
     try:
         if str(chat_id) == str(CHANNEL_ID) and not (user and user.is_bot):
             push_overlay(f"{name}: {text}")
+            push_studio(f"{name}: {text}")
     except Exception as e:
-        log.info(f"overlay mirror: {e}")
+        log.info(f"mirror: {e}")
 
     if _is_greet(text):
         lang = detect_lang(text)
@@ -608,23 +616,19 @@ async def group_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(response, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_donaciones(lang))
         return
 
+    # traducciones demo
     try:
         langs = CFG.get("audience_langs") or DEFAULT_AUDIENCE_LANGS
         if str(user.id) in MODEL_USER_IDS:
-            parts = []
-            for L in langs:
-                tr = GoogleTranslator(source="auto", target=L).translate(text)
-                parts.append(f"{L.upper()}: {tr}")
+            parts = [f"{L.upper()}: {GoogleTranslator(source='auto', target=L).translate(text)}" for L in langs]
             await msg.reply_text(t("en","assistant.translation_from_model") + "\n" + "\n".join(parts))
         else:
-            parts = []
-            for L in langs:
-                tr = GoogleTranslator(source="auto", target=L).translate(text)
-                parts.append(f"{L.upper()}: {tr}")
+            parts = [f"{L.upper()}: {GoogleTranslator(source='auto', target=L).translate(text)}" for L in langs]
             await msg.reply_text(t("en","assistant.translation_for_model") + "\n" + "\n".join(parts))
     except Exception as e:
         log.info(f"translate fail: {e}")
 
+# Posts del canal
 async def channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_activity
     last_activity = datetime.utcnow()
@@ -632,35 +636,35 @@ async def channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not post: return
     if post.text:
         push_overlay(f"📢 {post.text}")
+        push_studio(f"📢 {post.text}")
+
+# --- Auto ON/OFF por eventos de LIVE (video chat) ---
+async def svc_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Detecta inicio/fin de live en grupos/canales (video_chat_*)."""
+    global LIVE_ACTIVE
+    msg = update.effective_message
+    if not msg: return
+    if msg.video_chat_started:
+        LIVE_ACTIVE = True
+        push_studio("🟢 LIVE iniciado"); push_overlay("🟢 LIVE ON")
+        log.info("LIVE_ACTIVE=True (video_chat_started)")
+    if msg.video_chat_ended:
+        LIVE_ACTIVE = False
+        push_studio("🔴 LIVE finalizado"); push_overlay("🔴 LIVE OFF")
+        log.info("LIVE_ACTIVE=False (video_chat_ended)")
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("❌ Handler error", exc_info=context.error)
 
-# ========= Utils =========
-def _in_quiet_hours(now_utc: datetime) -> bool:
-    if not QUIET_HOURS: return False
-    try:
-        start_s, end_s = QUIET_HOURS.split("-")
-        start_h, end_h = int(start_s), int(end_s)
-        h = now_utc.hour
-        if start_h <= end_h:
-            return start_h <= h < end_h
-        else:
-            return h >= start_h or h < end_h
-    except Exception:
-        return False
-
-# ========= Scheduler =========
+# ========= Scheduler (solo si LIVE_ACTIVE) =========
 async def tick(app):
     global last_activity, last_ad
     while True:
         try:
             now = datetime.utcnow()
-            active = AUTO_MARKETING or LIVE_FORCED or (now - last_activity) < timedelta(minutes=15)
             due = (now - last_ad) >= timedelta(minutes=ANNOUNCE_EVERY_MIN)
-            quiet = _in_quiet_hours(now)
             cooldown = (now - last_activity) < timedelta(seconds=SUPPRESS_AFTER_DONATION_SEC)
-            if active and due and (not quiet) and CHANNEL_ID and (not cooldown):
+            if LIVE_ACTIVE and due and not cooldown and CHANNEL_ID:
                 await announce_prices(app.bot, int(CHANNEL_ID))
             await asyncio.sleep(20)
         except Exception as e:
@@ -668,7 +672,7 @@ async def tick(app):
 
 async def on_startup(app):
     app.create_task(tick(app))
-    log.info(f"✅ Scheduler cada {ANNOUNCE_EVERY_MIN} min | AUTO_MARKETING={'on' if AUTO_MARKETING else 'off'}")
+    log.info(f"✅ Scheduler cada {ANNOUNCE_EVERY_MIN} min (solo con LIVE_ACTIVE=True)")
 
 # ========= SINGLETON =========
 _app_singleton = None
@@ -684,19 +688,24 @@ def telegram_app_singleton():
     _app_singleton.add_handler(CommandHandler("start", start_cmd))
     _app_singleton.add_handler(CommandHandler("menu", menu_cmd))
     _app_singleton.add_handler(CommandHandler("precios", precios_cmd))
-    _app_singleton.add_handler(CommandHandler("studio", studio_cmd))
+    _app_singleton.add_handler(CommandHandler("studio", lambda u,c: u.message.reply_text(t("en","assistant.open_studio", url=f"{BASE_URL}/studio"))))
     _app_singleton.add_handler(CommandHandler("overlayon", overlay_on))
     _app_singleton.add_handler(CommandHandler("overlayoff", overlay_off))
-    _app_singleton.add_handler(CommandHandler("liveon", liveon))
-    _app_singleton.add_handler(CommandHandler("liveoff", liveoff))
+    _app_singleton.add_handler(CommandHandler("status", status_cmd))
+    _app_singleton.add_handler(CommandHandler("golive", golive_cmd))
+    _app_singleton.add_handler(CommandHandler("endlive", endlive_cmd))
     _app_singleton.add_handler(CommandHandler("addprice", addprice_cmd))
     _app_singleton.add_handler(CommandHandler("delprice", delprice_cmd))
     _app_singleton.add_handler(CommandHandler("listprices", listprices_cmd))
     _app_singleton.add_handler(CommandHandler("setlangs", setlangs_cmd))
     _app_singleton.add_handler(CommandHandler("setbio", setbio_cmd))
     _app_singleton.add_handler(CommandHandler("exportconfig", exportconfig_cmd))
-    _app_singleton.add_handler(MessageHandler(filters.TEXT & (~filters.ChatType.PRIVATE), group_msg))
+    # mensajes normales en grupos/supergrupos
+    _app_singleton.add_handler(MessageHandler(filters.TEXT & (~filters.ChatType.PRIVATE) & ~filters.ChatType.CHANNEL, group_msg))
+    # posts del canal
     _app_singleton.add_handler(MessageHandler(filters.ChatType.CHANNEL, channel_post))
+    # eventos de servicio (inicio/fin de live)
+    _app_singleton.add_handler(MessageHandler(filters.StatusUpdate.VIDEO_CHAT_STARTED | filters.StatusUpdate.VIDEO_CHAT_ENDED, svc_event))
     _app_singleton.add_error_handler(on_error)
     return _app_singleton
 
@@ -706,7 +715,6 @@ def run_web():
 
 if __name__ == "__main__":
     app = telegram_app_singleton()
-    # ⚠️ NO USAR 't' como variable (conflicta con función t()).
     web_thread = threading.Thread(target=run_web, daemon=True)
     web_thread.start()
     log.info("🤖 Iniciando bot (polling)…")
