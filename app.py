@@ -706,6 +706,8 @@ def run_web():
 
 if __name__ == "__main__":
     app = telegram_app_singleton()
-    t = threading.Thread(target=run_web, daemon=True); t.start()
+    # ⚠️ NO USAR 't' como variable (conflicta con función t()).
+    web_thread = threading.Thread(target=run_web, daemon=True)
+    web_thread.start()
     log.info("🤖 Iniciando bot (polling)…")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
