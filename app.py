@@ -1,5 +1,12 @@
-# app.py — CosplayLive (Telegram-only, sin OBS)
-# Versión estable: event loop FIX + Pillow opcional + Stripe + SSE Studio
+# app.py — CosplayLive (auto-anuncios estilo Chaturbate, sin OBS)
+# Incluye:
+# - FIX event loop (post_init)
+# - Anuncios automáticos cada N minutos (configurable por env)
+# - Rotación de mensajes (menú, CTA, meta, gracias)
+# - Pillow opcional (no se cae si falta)
+# - Flask + SSE /studio
+# - Stripe Checkout + webhook
+# - Traducción básica
 
 import os, sys, threading, logging, queue, io
 from datetime import datetime, timedelta
@@ -38,6 +45,11 @@ BASE_URL = os.getenv("BASE_URL", "")               # https://tuapp.onrender.com
 STRIPE_SK = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WH = os.getenv("STRIPE_WEBHOOK_SECRET", "") # whsec_***
 
+# Auto marketing (estilo Chaturbate)
+ANNOUNCE_EVERY_MIN = int(os.getenv("ANNOUNCE_EVERY_MIN", "5"))  # intervalo en minutos
+AUTO_MARKETING = os.getenv("AUTO_MARKETING", "on").lower() in ("1","on","true","yes")
+QUIET_HOURS = os.getenv("QUIET_HOURS", "")  # ej "02-08" para silenciar de 02:00 a 08:59
+
 if not TOKEN:
     raise SystemExit("⚠️ Falta TELEGRAM_TOKEN")
 if not STRIPE_SK:
@@ -47,10 +59,10 @@ if not PIL_OK:
 
 stripe.api_key = STRIPE_SK
 
-# ========= ESTADO SIMPLE =========
+# ========= ESTADO =========
 last_activity = datetime.utcnow() - timedelta(hours=1)
 last_ad = datetime.utcnow() - timedelta(hours=1)
-LIVE_FORCED = False
+LIVE_FORCED = True  # arrancamos activo por defecto (puedes /liveoff)
 PRICE_MENU = [
     ("💃 Baile", 3),
     ("👗 Probar lencería", 10),
@@ -58,6 +70,16 @@ PRICE_MENU = [
     ("🎯 Meta grupal", 50),
 ]
 CURRENCY = os.getenv("CURRENCY", "EUR")
+
+# Rotación de anuncios
+ROTATION = [
+    "✨ *Menú de apoyos y pedidos* (elige un botón) ↓",
+    "🎯 *Meta grupal:* cuando lleguemos a 50 EUR desbloqueamos *show especial*.",
+    "💡 *Tip:* Puedes dejar un mensaje con tu pedido cuando apoyes.",
+    "🔥 *Gracias por apoyar el show!* Usa los botones para participar.",
+]
+_rot_idx = 0
+SUPPRESS_AFTER_DONATION_SEC = 90  # pausa breve tras donación para no interrumpir
 
 # ========= COLA DE EVENTOS PARA /studio (SSE) =========
 events: "queue.Queue[str]" = queue.Queue(maxsize=200)
@@ -69,10 +91,8 @@ def push_event(text: str) -> None:
     try:
         events.put_nowait(text)
     except queue.Full:
-        try:
-            events.get_nowait()
-        except queue.Empty:
-            pass
+        try: events.get_nowait()
+        except queue.Empty: pass
         events.put_nowait(text)
 
 # ========= FLASK =========
@@ -159,17 +179,20 @@ def kb_donaciones() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("💝 Donar libre", url=f"{BASE_URL}/donar")])
     return InlineKeyboardMarkup(rows)
 
-async def announce_prices(bot, chat_id: int):
+async def announce_prices(bot, chat_id: int, prefix: str | None = None):
+    global last_ad, _rot_idx
+    header = prefix or ROTATION[_rot_idx % len(ROTATION)]
+    _rot_idx += 1
     text = (
-        "✨ *Menú de apoyos y pedidos:*\n\n" +
+        f"{header}\n\n" +
         "\n".join([f"• {n} — *{p}* {CURRENCY}" for n, p in PRICE_MENU]) +
         "\n\nToca un botón para pagar con tarjeta/PayPal (Stripe)."
     )
     await bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_donaciones())
-    global last_ad
     last_ad = datetime.utcnow()
 
 async def celebrate(bot, chat_id: int, user: str, amount: str, memo: str):
+    global last_activity, last_ad
     txt = f"🎉 *¡Gracias, {user}!*\nHas apoyado con *{amount}*.\n_{memo or '¡A tope con el show!'}_"
     msg = await bot.send_message(chat_id, txt, parse_mode=ParseMode.MARKDOWN)
     try:
@@ -192,6 +215,9 @@ async def celebrate(bot, chat_id: int, user: str, amount: str, memo: str):
     else:
         await bot.send_message(chat_id, "🖼️ (Tarjeta gráfica desactivada temporalmente)")
     push_event(f"🎉 Donación: {user} → {amount} | {memo or ''}")
+    # Pausa anuncios brevemente para no interrumpir la celebración
+    last_activity = datetime.utcnow()
+    last_ad = datetime.utcnow()
 
 # ====== STRIPE ======
 @web.get("/donar")
@@ -253,7 +279,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 ¡Bot activo! Usa /menu para ver donaciones o /precios.\n/studio te da la consola con alertas y sonido."
     )
     if chat and chat.id == int(CHANNEL_ID):
-        await announce_prices(context.bot, chat.id)
+        await announce_prices(context.bot, chat.id, prefix="🚀 *Show en vivo:* usa el menú para participar")
 
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_activity
@@ -268,6 +294,7 @@ async def precios_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def studio_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🎛️ Abre tu panel: {BASE_URL}/studio")
 
+# Eco + traducción en privados/grupos (no canal)
 async def echo_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_activity
     last_activity = datetime.utcnow()
@@ -282,15 +309,11 @@ async def echo_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = f"📩 {name}: {txt}"
     await update.message.reply_text(reply)
 
+# Mensajes del canal → refrescan actividad
 async def channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global last_activity
     last_activity = datetime.utcnow()
-    post = update.channel_post
-    if not post:
-        return
-    now = datetime.utcnow()
-    if (now - last_ad) > timedelta(minutes=10):
-        await announce_prices(context.bot, post.chat.id)
+    # No forzamos anuncio aquí: lo hace el scheduler
 
 async def liveon(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global LIVE_FORCED
@@ -305,24 +328,43 @@ async def liveoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("❌ Handler error", exc_info=context.error)
 
-# ========= SCHEDULER + STARTUP (FIX LOOP) =========
+# ========= UTIL =========
+def _in_quiet_hours(now_utc: datetime) -> bool:
+    if not QUIET_HOURS:
+        return False
+    try:
+        start_s, end_s = QUIET_HOURS.split("-")
+        start_h, end_h = int(start_s), int(end_s)
+        h = now_utc.hour
+        if start_h <= end_h:
+            return start_h <= h < end_h
+        else:
+            # ventana cruzando medianoche (ej. 22-06)
+            return h >= start_h or h < end_h
+    except Exception:
+        return False
+
+# ========= SCHEDULER + STARTUP =========
 async def tick(app):
     global last_activity, last_ad
     while True:
         try:
             now = datetime.utcnow()
-            active = LIVE_FORCED or (now - last_activity) < timedelta(minutes=15)
-            due = (now - last_ad) > timedelta(minutes=10)
-            if active and due and CHANNEL_ID:
+            # ¿Debemos anunciar?
+            active = AUTO_MARKETING or LIVE_FORCED or (now - last_activity) < timedelta(minutes=15)
+            due = (now - last_ad) >= timedelta(minutes=ANNOUNCE_EVERY_MIN)
+            quiet = _in_quiet_hours(now)
+            cooldown = (now - last_activity) < timedelta(seconds=SUPPRESS_AFTER_DONATION_SEC)
+            if active and due and (not quiet) and CHANNEL_ID and (not cooldown):
                 await announce_prices(app.bot, int(CHANNEL_ID))
-            await asyncio.sleep(30)
+            await asyncio.sleep(20)
         except Exception as e:
             log.error(f"scheduler: {e}")
             await asyncio.sleep(5)
 
 async def on_startup(app):
     app.create_task(tick(app))
-    log.info("✅ Scheduler iniciado correctamente (loop activo)")
+    log.info(f"✅ Scheduler activo cada {ANNOUNCE_EVERY_MIN} min | AUTO_MARKETING={'on' if AUTO_MARKETING else 'off'}")
 
 # ========= SINGLETON =========
 _app_singleton = None
