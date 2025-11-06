@@ -27,10 +27,13 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))           # -100xxxxxxxxxx
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "")     # sin @
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 CURRENCY = os.getenv("CURRENCY", "EUR")
-ADMIN_USER_IDS = os.getenv("ADMIN_USER_IDS", "")         # ej: "123,456"
 
-STRIPE_SECRET = os.getenv("STRIPE_SECRET", "")
+# Puede venir como STRIPE_SECRET o STRIPE_SECRET_KEY
+STRIPE_SECRET = os.getenv("STRIPE_SECRET") or os.getenv("STRIPE_SECRET_KEY", "")
 stripe.api_key = STRIPE_SECRET
+
+# Admins vía ENV (coma separada)
+ADMIN_USER_IDS_ENV = os.getenv("ADMIN_USER_IDS", "").strip()
 
 PORT = int(os.getenv("PORT", "10000"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -44,24 +47,32 @@ DATA_DIR = os.getenv("DATA_DIR", "/var/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 DATA_FILE = os.path.join(DATA_DIR, "data.json")
 
+def _parse_admins_env() -> List[int]:
+    return [int(x) for x in ADMIN_USER_IDS_ENV.split(",") if x.strip().isdigit()]
+
 def load_state() -> Dict[str, Any]:
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    state = {
+    """Carga estado; fusiona admins del ENV aunque exista el archivo."""
+    base = {
         "admins": [],
         "model_name": "Cosplay Emma",
         "langs": ["de","en","es","pl"],
         "marketing_on": False,
         "prices": [["Besito",1],["Cariño",3],["Te amo",5],["Regalito",7]],
     }
-    # Sembrar admins desde env
-    seeds = [int(x) for x in ADMIN_USER_IDS.split(",") if x.strip().isdigit()]
-    state["admins"].extend(seeds)
-    return state
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                base.update(json.load(f) or {})
+        except Exception as e:
+            log.warning(f"No se pudo leer data.json: {e}")
+
+    # Fusionar admins de ENV siempre
+    seed_env = _parse_admins_env()
+    current = set(int(x) for x in base.get("admins", []))
+    for a in seed_env:
+        current.add(a)
+    base["admins"] = sorted(current)
+    return base
 
 def save_state(s: Dict[str, Any]) -> None:
     tmp = DATA_FILE + ".tmp"
@@ -82,7 +93,7 @@ def telegram_app_singleton() -> Application:
     return _app_singleton
 
 # =========================
-# Overlay (SSE) – thread-safe con Queue
+# Overlay (SSE)
 # =========================
 class EventBus:
     def __init__(self): self._subs: List[Queue] = []
@@ -93,7 +104,7 @@ class EventBus:
         except ValueError: pass
     def push(self, payload: Dict[str, Any]):
         dead = []
-        for q in self._subs:
+        for q in list(self._subs):
             try: q.put_nowait(payload)
             except Exception: dead.append(q)
         for d in dead:
@@ -148,8 +159,19 @@ def kb_donaciones(user=None) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("💝 Donar libre", url=base+q)])
     return InlineKeyboardMarkup(rows)
 
-def is_admin(uid:int)->bool: return uid in STATE.get("admins",[])
-def set_marketing(on:bool): STATE["marketing_on"]=on; save_state(STATE)
+def _env_admin_ids_set() -> set:
+    return set(str(x).strip() for x in ADMIN_USER_IDS_ENV.split(",") if x.strip())
+
+def is_admin(uid:int)->bool:
+    # Admin si:
+    # - está en data.json, o
+    # - su id aparece en ADMIN_USER_IDS (ENV)
+    env_ok = str(uid) in _env_admin_ids_set()
+    file_ok = uid in STATE.get("admins", [])
+    return env_ok or file_ok
+
+def set_marketing(on:bool):
+    STATE["marketing_on"]=on; save_state(STATE)
 
 # =========================
 # Handlers
@@ -165,19 +187,18 @@ async def cmd_start(update: Update, ctx: CallbackContext):
 async def cmd_menu(update: Update, ctx: CallbackContext):
     await update.message.reply_text("💝 Opciones de apoyo:", reply_markup=kb_donaciones(update.effective_user))
 
-# --- NUEVO: /whoami (no requiere ser admin) ---
 async def cmd_whoami(update: Update, ctx: CallbackContext):
     u = update.effective_user
     uid = u.id
     uname = f"@{u.username}" if u.username else "(sin username)"
     await update.message.reply_text(f"Tu user_id: {uid}\nUsername: {uname}")
 
-# --- NUEVO: /admins (lista actual) ---
 async def cmd_admins(update: Update, ctx: CallbackContext):
-    ids = STATE.get("admins", [])
-    if not ids:
-        return await update.message.reply_text("No hay admins guardados.")
-    await update.message.reply_text("Admins:\n" + "\n".join(str(x) for x in ids))
+    ids_file = STATE.get("admins", [])
+    ids_env = sorted(_env_admin_ids_set())
+    txt = "Admins (archivo): " + (", ".join(str(x) for x in ids_file) or "—")
+    txt += "\nAdmins (ENV): " + (", ".join(ids_env) or "—")
+    await update.message.reply_text(txt)
 
 async def cmd_iamadmin(update: Update, ctx: CallbackContext):
     uid=update.effective_user.id
@@ -238,7 +259,7 @@ async def on_group_live_end(update: Update, ctx: CallbackContext):
     set_marketing(False)
     await ctx.bot.send_message(update.effective_chat.id, "⚫️ LIVE finalizado. Marketing detenido.")
 
-# LIVE START/END — canales
+# LIVE START/END — canales (PTB 20.8)
 async def on_channel_live_start(update: Update, ctx: CallbackContext):
     set_marketing(True)
     await ctx.bot.send_message(CHANNEL_ID, "🔴 LIVE detectado (canal). Marketing activado.")
@@ -366,8 +387,8 @@ def main():
     # Comandos
     app.add_handler(CommandHandler(["start","help"], cmd_start))
     app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(CommandHandler("whoami", cmd_whoami))   # << nuevo
-    app.add_handler(CommandHandler("admins", cmd_admins))   # << nuevo
+    app.add_handler(CommandHandler("whoami", cmd_whoami))
+    app.add_handler(CommandHandler("admins", cmd_admins))
     app.add_handler(CommandHandler("iamadmin", cmd_iamadmin))
     app.add_handler(CommandHandler("liveon", cmd_liveon))
     app.add_handler(CommandHandler("liveoff", cmd_liveoff))
