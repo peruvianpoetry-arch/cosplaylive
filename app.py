@@ -1,7 +1,7 @@
-import os, io, json, asyncio, time, logging
-from datetime import datetime
-from typing import Dict, Any, List, Optional
+import os, io, json, time, logging, asyncio
 from threading import Thread
+from typing import Dict, Any, List, Optional
+from queue import Queue
 
 from flask import Flask, request, Response
 
@@ -9,8 +9,8 @@ from flask import Flask, request, Response
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler, MessageHandler,
-    ChannelPostHandler, CallbackContext, filters
+    Application, ApplicationBuilder, CommandHandler,
+    MessageHandler, CallbackContext, filters
 )
 
 # --- Stripe ---
@@ -31,9 +31,9 @@ ADMIN_USER_IDS = os.getenv("ADMIN_USER_IDS", "")         # ej: "123,456"
 
 STRIPE_SECRET = os.getenv("STRIPE_SECRET", "")
 stripe.api_key = STRIPE_SECRET
+
 PORT = int(os.getenv("PORT", "10000"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
 logging.basicConfig(level=LOG_LEVEL)
 log = logging.getLogger("cosplaylive")
 
@@ -58,7 +58,7 @@ def load_state() -> Dict[str, Any]:
         "marketing_on": False,
         "prices": [["Besito",1],["Cariño",3],["Te amo",5],["Regalito",7]],
     }
-    # si hay ADMIN_USER_IDS, sembrar
+    # Sembrar admins desde env
     seeds = [int(x) for x in ADMIN_USER_IDS.split(",") if x.strip().isdigit()]
     state["admins"].extend(seeds)
     return state
@@ -82,18 +82,24 @@ def telegram_app_singleton() -> Application:
     return _app_singleton
 
 # =========================
-# Overlay (SSE)
+# Overlay (SSE) – thread-safe con Queue
 # =========================
 class EventBus:
-    def __init__(self): self._subs: List[asyncio.Queue] = []
-    async def subscribe(self): 
-        q = asyncio.Queue(); self._subs.append(q); return q
-    async def unsubscribe(self, q):
-        if q in self._subs: self._subs.remove(q)
-    async def push(self, payload: Dict[str, Any]):
-        for q in list(self._subs):
+    def __init__(self): self._subs: List[Queue] = []
+    def subscribe(self) -> Queue:
+        q: Queue = Queue(); self._subs.append(q); return q
+    def unsubscribe(self, q: Queue):
+        try: self._subs.remove(q)
+        except ValueError: pass
+    def push(self, payload: Dict[str, Any]):
+        # enviar a todos los suscriptores (no bloqueante si nadie escucha)
+        dead = []
+        for q in self._subs:
             try: q.put_nowait(payload)
-            except: pass
+            except Exception: dead.append(q)
+        for d in dead:
+            try: self._subs.remove(d)
+            except ValueError: pass
 
 EVENTS = EventBus()
 
@@ -108,14 +114,12 @@ def build_card(title: str, subtitle: str) -> bytes:
     try:
         f1 = ImageFont.truetype("DejaVuSans-Bold.ttf", 68)
         f2 = ImageFont.truetype("DejaVuSans.ttf", 44)
-    except: f1=f2=ImageFont.load_default()
+    except Exception:
+        f1 = f2 = ImageFont.load_default()
     d.rounded_rectangle([(20,20),(W-20,H-20)], radius=28, fill=(18,27,46))
     d.text(_center(d,title,f1,140), title, font=f1, fill=(255,255,255))
     d.text(_center(d,subtitle,f2,260), subtitle, font=f2, fill=(190,220,255))
     buf=io.BytesIO(); img.save(buf,"PNG"); buf.seek(0); return buf.read()
-
-async def push_event(event_type: str, data: Dict[str, Any]):
-    await EVENTS.push({"type":event_type,"data":data,"ts":int(time.time())})
 
 async def celebrate(bot, chat_id: int, payer_name: str, amount: str, memo: str):
     title = f"{payer_name} apoyó {amount}"
@@ -124,7 +128,7 @@ async def celebrate(bot, chat_id: int, payer_name: str, amount: str, memo: str):
                                  parse_mode=ParseMode.MARKDOWN)
     await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
     await bot.send_photo(chat_id, png, caption=f"Gracias {payer_name} 🫶")
-    await push_event("donation", {"payer":payer_name,"amount":amount,"memo":memo})
+    EVENTS.push({"type":"donation","data":{"payer":payer_name,"amount":amount,"memo":memo},"ts":int(time.time())})
 
 def kb_donaciones(user=None) -> InlineKeyboardMarkup:
     rows=[]; uid=uname=""
@@ -158,23 +162,29 @@ async def cmd_start(update: Update, ctx: CallbackContext):
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=kb_donaciones(update.effective_user)
     )
+
 async def cmd_menu(update: Update, ctx: CallbackContext):
     await update.message.reply_text("💝 Opciones de apoyo:", reply_markup=kb_donaciones(update.effective_user))
+
 async def cmd_iamadmin(update: Update, ctx: CallbackContext):
     uid=update.effective_user.id
     if uid not in STATE["admins"]:
         STATE["admins"].append(uid); save_state(STATE)
     await update.message.reply_text("✅ Ya eres admin de este bot.")
+
 async def _admin_guard(update: Update): 
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("Solo admin."); return False
     return True
+
 async def cmd_liveon(update: Update, ctx: CallbackContext):
     if not await _admin_guard(update): return
     set_marketing(True); await update.message.reply_text("🟢 LIVE activado.")
+
 async def cmd_liveoff(update: Update, ctx: CallbackContext):
     if not await _admin_guard(update): return
     set_marketing(False); await update.message.reply_text("🔴 LIVE desactivado.")
+
 async def cmd_addprice(update: Update, ctx: CallbackContext):
     if not await _admin_guard(update): return
     arg=update.message.text.split(" ",1)[-1].strip()
@@ -184,41 +194,48 @@ async def cmd_addprice(update: Update, ctx: CallbackContext):
     except: return await update.message.reply_text("Precio inválido.")
     STATE["prices"].append([name,price]); save_state(STATE)
     await update.message.reply_text("✅ Precio agregado.")
+
 async def cmd_delprice(update: Update, ctx: CallbackContext):
     if not await _admin_guard(update): return
     name=update.message.text.split(" ",1)[-1].strip()
     before=len(STATE["prices"])
     STATE["prices"]=[p for p in STATE["prices"] if p[0]!=name]; save_state(STATE)
     await update.message.reply_text("✅ Eliminado." if len(STATE["prices"])<before else "No encontrado.")
+
 async def cmd_listprices(update: Update, ctx: CallbackContext):
     lines=[f"• {n} · {v} {CURRENCY}" for n,v in STATE.get("prices",[])]
     await update.message.reply_text("Precios actuales:\n"+"\n".join(lines))
 
-# Marketing en grupo
+# Marketing en grupos
 async def on_group_text(update: Update, ctx: CallbackContext):
     if STATE.get("marketing_on"):
-        await ctx.bot.send_message(update.effective_chat.id,
+        await ctx.bot.send_message(
+            update.effective_chat.id,
             f"💝 Apoya a *{STATE.get('model_name')}* y aparece en pantalla.",
-            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_donaciones())
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb_donaciones()
+        )
 
 # LIVE START/END — grupos
 async def on_group_live_start(update: Update, ctx: CallbackContext):
     set_marketing(True)
     await ctx.bot.send_message(update.effective_chat.id, "🔴 LIVE detectado (grupo). Marketing activado.")
+
 async def on_group_live_end(update: Update, ctx: CallbackContext):
     set_marketing(False)
     await ctx.bot.send_message(update.effective_chat.id, "⚫️ LIVE finalizado. Marketing detenido.")
 
-# LIVE START/END — canales (requiere bot admin del canal)
+# LIVE START/END — canales (con MessageHandler + filtros.CHANNEL)
 async def on_channel_live_start(update: Update, ctx: CallbackContext):
     set_marketing(True)
     await ctx.bot.send_message(CHANNEL_ID, "🔴 LIVE detectado (canal). Marketing activado.")
+
 async def on_channel_live_end(update: Update, ctx: CallbackContext):
     set_marketing(False)
     await ctx.bot.send_message(CHANNEL_ID, "⚫️ LIVE finalizado. Marketing detenido.")
 
 # =========================
-# Flask
+# Flask (web)
 # =========================
 web = Flask(__name__)
 
@@ -226,7 +243,7 @@ web = Flask(__name__)
 def index(): return "CosplayLive bot OK"
 
 @web.get("/overlay")
-def overlay():
+def overlay_page():
     return """
 <!doctype html><meta charset="utf-8">
 <title>Overlay</title>
@@ -248,20 +265,19 @@ def overlay():
 </script>"""
 
 @web.get("/events")
-def sse():
-    async def gen():
-        q = await EVENTS.subscribe()
+def sse_events():
+    q = EVENTS.subscribe()
+    def stream():
         try:
             while True:
-                item = await q.get()
+                item = q.get()  # blocking hasta evento
                 yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
         finally:
-            await EVENTS.unsubscribe(q)
-    loop = asyncio.new_event_loop()
-    return Response(loop.run_until_complete(gen()), mimetype="text/event-stream")
+            EVENTS.unsubscribe(q)
+    return Response(stream(), mimetype="text/event-stream")
 
 @web.get("/studio")
-def studio():
+def studio_page():
     return f"""<!doctype html><meta charset="utf-8">
 <h2>Studio – {STATE.get('model_name')}</h2>
 <p><a href="{BASE_URL}/overlay" target="_blank">Abrir Overlay</a></p>
@@ -269,12 +285,9 @@ def studio():
 
 @web.post("/studio/ding")
 def studio_ding():
-    app = telegram_app_singleton()
-    # Ejecutar la corrutina en el loop de PTB (FIX del 500)
-    asyncio.run_coroutine_threadsafe(
-        push_event("donation", {"payer":"TestUser","amount":"0.00","memo":"Test"}),
-        app.loop
-    )
+    # Empujar un evento de prueba (no async → sin error 500)
+    EVENTS.push({"type":"donation","data":{"payer":"TestUser","amount":"0.00","memo":"Test"},
+                 "ts":int(time.time())})
     return "<p>OK (revisa el Overlay).</p>"
 
 @web.get("/donar")
@@ -324,7 +337,7 @@ def stripe_webhook():
         amount = md.get("amount") or f"{(sess.get('amount_total') or 0)/100:.2f} {(sess.get('currency') or '').upper()}"
         memo = "¡Gracias por tu apoyo!"
         app = telegram_app_singleton()
-        # Ejecutar la celebración en el loop de PTB (FIX)
+        # Ejecutar la celebración en el loop de PTB (desde hilo Flask)
         asyncio.run_coroutine_threadsafe(
             celebrate(app.bot, int(CHANNEL_ID), payer_name, amount, memo),
             app.loop
@@ -339,7 +352,7 @@ def run_flask(): web.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=Fa
 def main():
     app = telegram_app_singleton()
 
-    # comandos
+    # Comandos
     app.add_handler(CommandHandler(["start","help"], cmd_start))
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CommandHandler("iamadmin", cmd_iamadmin))
@@ -349,16 +362,16 @@ def main():
     app.add_handler(CommandHandler("delprice", cmd_delprice))
     app.add_handler(CommandHandler("listprices", cmd_listprices))
 
-    # grupo: mensajes y LIVE start/end
+    # Grupo: texto y LIVE start/end
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT, on_group_text))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.VIDEO_CHAT_STARTED, on_group_live_start))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.VIDEO_CHAT_ENDED, on_group_live_end))
 
-    # canal: LIVE start/end (requiere admin en canal)
-    app.add_handler(ChannelPostHandler(filters.StatusUpdate.VIDEO_CHAT_STARTED, on_channel_live_start))
-    app.add_handler(ChannelPostHandler(filters.StatusUpdate.VIDEO_CHAT_ENDED, on_channel_live_end))
+    # Canal: LIVE start/end (compatíble PTB 20.8)
+    app.add_handler(MessageHandler(filters.ChatType.CHANNEL & filters.StatusUpdate.VIDEO_CHAT_STARTED, on_channel_live_start))
+    app.add_handler(MessageHandler(filters.ChatType.CHANNEL & filters.StatusUpdate.VIDEO_CHAT_ENDED, on_channel_live_end))
 
-    # lanzar Flask en hilo
+    # Lanzar Flask en hilo
     Thread(target=run_flask, daemon=True).start()
     log.info("Starting polling…")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
