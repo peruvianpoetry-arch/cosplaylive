@@ -92,7 +92,6 @@ class EventBus:
         try: self._subs.remove(q)
         except ValueError: pass
     def push(self, payload: Dict[str, Any]):
-        # enviar a todos los suscriptores (no bloqueante si nadie escucha)
         dead = []
         for q in self._subs:
             try: q.put_nowait(payload)
@@ -166,6 +165,20 @@ async def cmd_start(update: Update, ctx: CallbackContext):
 async def cmd_menu(update: Update, ctx: CallbackContext):
     await update.message.reply_text("💝 Opciones de apoyo:", reply_markup=kb_donaciones(update.effective_user))
 
+# --- NUEVO: /whoami (no requiere ser admin) ---
+async def cmd_whoami(update: Update, ctx: CallbackContext):
+    u = update.effective_user
+    uid = u.id
+    uname = f"@{u.username}" if u.username else "(sin username)"
+    await update.message.reply_text(f"Tu user_id: {uid}\nUsername: {uname}")
+
+# --- NUEVO: /admins (lista actual) ---
+async def cmd_admins(update: Update, ctx: CallbackContext):
+    ids = STATE.get("admins", [])
+    if not ids:
+        return await update.message.reply_text("No hay admins guardados.")
+    await update.message.reply_text("Admins:\n" + "\n".join(str(x) for x in ids))
+
 async def cmd_iamadmin(update: Update, ctx: CallbackContext):
     uid=update.effective_user.id
     if uid not in STATE["admins"]:
@@ -225,7 +238,7 @@ async def on_group_live_end(update: Update, ctx: CallbackContext):
     set_marketing(False)
     await ctx.bot.send_message(update.effective_chat.id, "⚫️ LIVE finalizado. Marketing detenido.")
 
-# LIVE START/END — canales (con MessageHandler + filtros.CHANNEL)
+# LIVE START/END — canales
 async def on_channel_live_start(update: Update, ctx: CallbackContext):
     set_marketing(True)
     await ctx.bot.send_message(CHANNEL_ID, "🔴 LIVE detectado (canal). Marketing activado.")
@@ -270,7 +283,7 @@ def sse_events():
     def stream():
         try:
             while True:
-                item = q.get()  # blocking hasta evento
+                item = q.get()
                 yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
         finally:
             EVENTS.unsubscribe(q)
@@ -285,7 +298,6 @@ def studio_page():
 
 @web.post("/studio/ding")
 def studio_ding():
-    # Empujar un evento de prueba (no async → sin error 500)
     EVENTS.push({"type":"donation","data":{"payer":"TestUser","amount":"0.00","memo":"Test"},
                  "ts":int(time.time())})
     return "<p>OK (revisa el Overlay).</p>"
@@ -337,7 +349,6 @@ def stripe_webhook():
         amount = md.get("amount") or f"{(sess.get('amount_total') or 0)/100:.2f} {(sess.get('currency') or '').upper()}"
         memo = "¡Gracias por tu apoyo!"
         app = telegram_app_singleton()
-        # Ejecutar la celebración en el loop de PTB (desde hilo Flask)
         asyncio.run_coroutine_threadsafe(
             celebrate(app.bot, int(CHANNEL_ID), payer_name, amount, memo),
             app.loop
@@ -355,6 +366,8 @@ def main():
     # Comandos
     app.add_handler(CommandHandler(["start","help"], cmd_start))
     app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("whoami", cmd_whoami))   # << nuevo
+    app.add_handler(CommandHandler("admins", cmd_admins))   # << nuevo
     app.add_handler(CommandHandler("iamadmin", cmd_iamadmin))
     app.add_handler(CommandHandler("liveon", cmd_liveon))
     app.add_handler(CommandHandler("liveoff", cmd_liveoff))
@@ -367,7 +380,7 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.VIDEO_CHAT_STARTED, on_group_live_start))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.VIDEO_CHAT_ENDED, on_group_live_end))
 
-    # Canal: LIVE start/end (compatíble PTB 20.8)
+    # Canal: LIVE start/end (PTB 20.8)
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL & filters.StatusUpdate.VIDEO_CHAT_STARTED, on_channel_live_start))
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL & filters.StatusUpdate.VIDEO_CHAT_ENDED, on_channel_live_end))
 
