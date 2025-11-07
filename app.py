@@ -12,7 +12,7 @@ from telegram import (
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, MessageHandler,
-    filters, ContextTypes, CallbackQueryHandler
+    filters, ContextTypes
 )
 
 # -------------------- Traducción (opcional) --------------------
@@ -45,10 +45,10 @@ def load_state() -> Dict:
         except Exception:
             pass
     return {
-        "admins": [],             # lista de user_id
+        "admins": [],
         "model_name": DEFAULT_MODEL_NAME,
         "currency": DEFAULT_CC,
-        "prices": [                # demo inicial (puedes vaciarla con /resetprices)
+        "prices": [
             ["Group goal", 50],
             ["Freier Betrag", 0],
         ],
@@ -83,8 +83,10 @@ def kb_menu(user=None) -> InlineKeyboardMarkup:
         q = f"?c={state['currency']}"
         if price and price > 0:
             q += f"&amt={price}"
-        if uid:   q += f"&uid={uid}"
-        if uname: q += f"&uname={uname}"
+        if uid:
+            q += f"&uid={uid}"
+        if uname:
+            q += f"&uname={uname}"
         return base + q
 
     for name, price in state["prices"]:
@@ -96,11 +98,10 @@ def kb_menu(user=None) -> InlineKeyboardMarkup:
 def app_title():
     return f"Asistente de <b>{state['model_name']}</b>."
 
-# -------------------- Overlay / Server-Sent Events --------------------
+# -------------------- Overlay / SSE --------------------
 overlay_clients: List[asyncio.Queue] = []
 
 async def push_event(payload: Dict):
-    # notificar a todos los clientes conectados al overlay
     dead = []
     for q in overlay_clients:
         try:
@@ -108,11 +109,14 @@ async def push_event(payload: Dict):
         except Exception:
             dead.append(q)
     for q in dead:
-        try: overlay_clients.remove(q)
-        except: pass
+        try:
+            overlay_clients.remove(q)
+        except:
+            pass
 
-# -------------------- Telegram App Singleton --------------------
+# -------------------- Telegram App --------------------
 _telegram_app: Application = None
+
 def telegram_app_singleton() -> Application:
     global _telegram_app
     if _telegram_app:
@@ -123,7 +127,7 @@ def telegram_app_singleton() -> Application:
         .concurrent_updates(True)
         .build()
     )
-    # --- Handlers ---
+
     _telegram_app.add_handler(CommandHandler("start", cmd_start))
     _telegram_app.add_handler(CommandHandler("menu", cmd_menu))
     _telegram_app.add_handler(CommandHandler("studio", cmd_studio))
@@ -137,11 +141,8 @@ def telegram_app_singleton() -> Application:
     _telegram_app.add_handler(CommandHandler("setccy", cmd_setccy))
     _telegram_app.add_handler(CommandHandler("liveon", cmd_liveon))
     _telegram_app.add_handler(CommandHandler("liveoff", cmd_liveoff))
-
-    # Responder actividad en grupo de discusión (bienvenida + menú + traducción)
     _telegram_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_text_any))
 
-    # Lanza el loop del bot en thread aparte al arrancar Flask
     threading.Thread(target=_telegram_app.run_polling, kwargs={"allowed_updates": Update.ALL_TYPES}, daemon=True).start()
     return _telegram_app
 
@@ -169,13 +170,22 @@ async def cmd_iamadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    await update.effective_chat.send_message(f"Tu user_id: <code>{u.id}</code>\nUsername: @{u.username}", parse_mode=ParseMode.HTML)
+    await update.effective_chat.send_message(
+        f"Tu user_id: <code>{u.id}</code>\nUsername: @{u.username}",
+        parse_mode=ParseMode.HTML,
+    )
 
+# ✅ bloque corregido
 async def cmd_listprices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not state["prices"]:
         await update.effective_chat.send_message("No hay precios.")
         return
-    lines = [f"• {n} — {p} {state['currency']}" if p else f"• {n} — libre" for n, p in state["prices"]]
+    lines = []
+    for n, p in state["prices"]:
+        if p:
+            lines.append(f"• {n} — {p} {state['currency']}")
+        else:
+            lines.append(f"• {n} — libre")
     await update.effective_chat.send_message("\n".join(lines))
 
 @ensure_admin
@@ -186,17 +196,12 @@ async def cmd_resetprices(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @ensure_admin
 async def cmd_addprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Formatos aceptados:
-    # /addprice Nombre · 7
-    # /addprice Nombre 7
-    # /addprice Nombre - 7
     txt = (update.message.text or "").strip()
     parts = txt.split(" ", 1)
     if len(parts) < 2:
         await update.effective_chat.send_message("Usa: /addprice Nombre · 7")
         return
     rest = parts[1].strip()
-    # Normaliza separadores
     for sep in [" · ", " - ", " — ", " – "]:
         rest = rest.replace(sep, " ")
     toks = rest.split()
@@ -207,7 +212,6 @@ async def cmd_addprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         price = float(toks[-1].replace(",", "."))
         name = " ".join(toks[:-1]).strip()
     except ValueError:
-        # sin precio => libre
         name = rest
         price = 0.0
     if not name:
@@ -215,7 +219,8 @@ async def cmd_addprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     state["prices"].append([name, price])
     save_state(state)
-    await update.effective_chat.send_message(f"✅ Añadido: {name} ({'libre' if price==0 else f'{price} {state['currency']}'})")
+    msg = f"✅ Añadido: {name} ({'libre' if price==0 else str(price)+' '+state['currency']})"
+    await update.effective_chat.send_message(msg)
 
 @ensure_admin
 async def cmd_delprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -228,7 +233,7 @@ async def cmd_delprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state["prices"] = [x for x in state["prices"] if x[0].lower() != key]
     save_state(state)
     removed = before - len(state["prices"])
-    await update.effective_chat.send_message("Eliminados: %d" % removed)
+    await update.effective_chat.send_message(f"Eliminados: {removed}")
 
 @ensure_admin
 async def cmd_setmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -262,27 +267,24 @@ async def cmd_liveoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_state(state)
     await update.effective_chat.send_message("🔴 LIVE desactivado.")
 
-# Bienvenida / traducción / marketing básico en grupo
+# -------------------- Respuesta general --------------------
 async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
         return
-    # 1) Bienvenida simplificada
+
     if update.message and update.message.new_chat_members:
         for m in update.message.new_chat_members:
             await chat.send_message(f"👋 Bienvenido, @{m.username or m.first_name}!")
         return
 
-    # 2) Traducción (opcional) reemite como INFO para la modelo
     if ENABLE_TRANSLATION and update.message and update.message.text:
-        user_lang = "de"  # heurística simple; cámbiala si quieres por detección
         try:
-            translated = GoogleTranslator(source='auto', target='es').translate(update.message.text)
+            translated = GoogleTranslator(source="auto", target="es").translate(update.message.text)
             await chat.send_message(f"🈯️ Traducción para la modelo:\n<code>{translated}</code>", parse_mode=ParseMode.HTML)
         except Exception:
             pass
 
-    # 3) Marketing básico si hay LIVE
     if state["live"]:
         try:
             await chat.send_message(
@@ -293,13 +295,6 @@ async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass
-
-# -------------------- Eventos de celebración --------------------
-async def celebrate(bot, chat_id: int, payer_name: str, amount: str, memo: str):
-    text = f"🎉 Gracias {payer_name} por {amount}!\n{memo}"
-    await bot.send_message(chat_id, text)
-    # Empuja al overlay 1 evento con sonido
-    await push_event({"type": "ding", "text": text})
 
 # -------------------- Flask --------------------
 web = Flask(__name__)
@@ -323,7 +318,6 @@ def overlay():
     loop = asyncio.get_event_loop()
 
     def generate():
-        # primera conexión: limpio
         yield "data: {}\n\n"
         while True:
             data = loop.run_until_complete(q.get())
@@ -333,27 +327,23 @@ def overlay():
 
 @web.get("/studio")
 def studio():
-    return """
-    <h2>Studio – {model}</h2>
+    return f"""
+    <h2>Studio – {state['model_name']}</h2>
     <p><a href="/overlay" target="_blank">Abrir Overlay</a></p>
     <form action="/studio/ding" method="post"><button>🔔 Probar sonido</button></form>
-    """.format(model=state["model_name"])
+    """
 
 @web.post("/studio/ding")
 def studio_ding():
-    app = telegram_app_singleton()
-    # Ejecuta la corrutina en el loop del bot
-    asyncio.get_event_loop().create_task(push_event({"type":"ding","text":"Test"}))
+    asyncio.get_event_loop().create_task(push_event({"type": "ding", "text": "Test"}))
     return "OK"
 
-# Página OK con volver a Telegram
 @web.get("/ok")
 def ok_page():
     tg_link = f"tg://resolve?domain={CHANNEL_USERNAME}" if CHANNEL_USERNAME else ""
     btn = f'<p><a href="{tg_link}">Volver a Telegram</a></p>' if tg_link else ""
     return f"<h2>✅ Pago recibido (modo test)</h2>{btn}"
 
-# Stripe: página de donación
 @web.get("/donar")
 def donate_page():
     amt = request.args.get("amt", "").strip()
@@ -380,50 +370,37 @@ def donate_page():
             }],
             success_url=f"{BASE_URL}/ok",
             cancel_url=f"{BASE_URL}/ok",
-            metadata={
-                "channel_id": str(CHANNEL_ID),
-                "amount": f"{v:.2f} {ccy}",
-                "uid": uid,
-                "uname": uname
-            },
+            metadata={"channel_id": str(CHANNEL_ID), "amount": f"{v:.2f} {ccy}", "uid": uid, "uname": uname},
         )
         return f'<meta http-equiv="refresh" content="0;url={session.url}">'
     else:
-        # libre: pedir cantidad
-        return """
+        return f"""
         <h3>Donación libre</h3>
         <form method="get" action="/donar">
           <input name="amt" placeholder="Cantidad" />
           <input type="hidden" name="c" value="{ccy}">
           <button type="submit">Pagar</button>
         </form>
-        """.format(ccy=ccy)
+        """
 
-# Webhook Stripe (modo test: no es obligatorio, pero lo dejamos)
 @web.post("/stripe_webhook")
 def stripe_webhook():
-    payload = request.get_data(as_text=True)
-    sig = request.headers.get("Stripe-Signature", "")
-    # Si no tienes endpoint secret, aceptamos sin verificar en test:
     try:
-        event = json.loads(payload)
+        event = json.loads(request.get_data(as_text=True))
     except Exception:
         return "bad", 400
 
-    et = event.get("type")
-    if et == "checkout.session.completed":
+    if event.get("type") == "checkout.session.completed":
         sess = event["data"]["object"]
-        md = (sess.get("metadata") or {})
-        uname = (md.get("uname") or "").strip()
+        md = sess.get("metadata") or {}
+        uname = md.get("uname", "")
         payer = f"@{uname}" if uname else "Supporter"
-        amount = md.get("amount") or f"{(sess.get('amount_total') or 0)/100:.2f} {(sess.get('currency') or '').upper()}"
-        memo = "¡Gracias por tu apoyo!"
-        app = telegram_app_singleton()
-        app.create_task(celebrate(app.bot, CHANNEL_ID, payer, amount, memo))
+        amount = md.get("amount", "")
+        asyncio.get_event_loop().create_task(push_event({"type": "ding", "text": f"🎉 Gracias {payer} por {amount}!"}))
     return "ok", 200
 
-# -------------------- Lanzar todo --------------------
+# -------------------- Lanzar --------------------
 if __name__ == "__main__":
-    telegram_app_singleton()  # arranca el bot (polling) en un thread
+    telegram_app_singleton()
     port = int(os.getenv("PORT", "10000"))
     web.run(host="0.0.0.0", port=port)
