@@ -1,33 +1,22 @@
+# app.py — CosplayLive (versión grupo + canal + traducción + precios + studio GET/POST)
 import os, io, json, time, logging, asyncio, re
 from threading import Thread
 from typing import Dict, Any, List, Optional
 from queue import Queue
 from flask import Flask, request, Response
 
-# Telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (Application, ApplicationBuilder, CommandHandler,
                           MessageHandler, CallbackContext, filters)
 
-# Stripe
 import stripe
-
-# Imagen
 from PIL import Image, ImageDraw, ImageFont
 
-# Traducción (opcional)
-ENABLE_TRANSLATION = os.getenv("ENABLE_TRANSLATION", "0") == "1"
-if ENABLE_TRANSLATION:
-    try:
-        from deep_translator import GoogleTranslator
-    except Exception:
-        ENABLE_TRANSLATION = False
-
-# ================= Config =================
+# ===== Config =====
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN","")
-CHANNEL_ID       = int(os.getenv("CHANNEL_ID","0"))     # -100xxxxxxxxxx
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME","")     # sin @
+CHANNEL_ID       = int(os.getenv("CHANNEL_ID","0"))     # -100xxxxxxxx
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME","")
 BASE_URL         = os.getenv("BASE_URL","").rstrip("/")
 CURRENCY         = os.getenv("CURRENCY","EUR")
 ADMIN_USER_IDS   = os.getenv("ADMIN_USER_IDS","").strip()
@@ -37,7 +26,15 @@ PORT             = int(os.getenv("PORT","10000"))
 logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO").upper())
 log = logging.getLogger("cosplaylive")
 
-# ================= Estado en disco =================
+# Traducción (opcional)
+ENABLE_TRANSLATION = os.getenv("ENABLE_TRANSLATION","0") == "1"
+if ENABLE_TRANSLATION:
+    try:
+        from deep_translator import GoogleTranslator
+    except Exception:
+        ENABLE_TRANSLATION = False
+
+# ===== Estado en disco =====
 DATA_DIR  = os.getenv("DATA_DIR","/var/data"); os.makedirs(DATA_DIR, exist_ok=True)
 DATA_FILE = os.path.join(DATA_DIR, "data.json")
 
@@ -48,8 +45,8 @@ def _default_state():
     return {
         "admins": [],
         "model_name": "Cosplay Emma",
-        "model_id": 0,                 # se puede fijar con /setmodelid me o /setmodelid 123
-        "langs": ["de","en","es","pl"],# prioridad de salida (modelo -> primer idioma)
+        "model_id": 0,
+        "langs": ["de","en","es","pl"],
         "marketing_on": False,
         "last_push_ts": 0,
         "prices": [["Goal 10s", 3], ["Kiss", 5], ["Song", 7], ["Dance", 10]],
@@ -61,7 +58,7 @@ def load_state() -> Dict[str, Any]:
         try:
             with open(DATA_FILE,"r",encoding="utf-8") as f: st.update(json.load(f) or {})
         except Exception as e: log.warning(f"data.json read: {e}")
-    # fusionar admins del ENV SIEMPRE
+    # fusionar admins ENV
     current = set(int(x) for x in st.get("admins",[]))
     for a in _parse_admins_env(): current.add(a)
     st["admins"] = sorted(current)
@@ -74,7 +71,7 @@ def save_state(st: Dict[str, Any]):
 
 STATE = load_state()
 
-# ============== Telegram app singleton ==============
+# ===== Telegram app singleton =====
 _app_singleton: Optional[Application] = None
 def telegram_app_singleton() -> Application:
     global _app_singleton
@@ -82,7 +79,7 @@ def telegram_app_singleton() -> Application:
         _app_singleton = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     return _app_singleton
 
-# ================= Overlay (SSE) =================
+# ===== Overlay (SSE) =====
 class EventBus:
     def __init__(self): self._subs: List[Queue] = []
     def subscribe(self) -> Queue:
@@ -121,7 +118,6 @@ async def celebrate(bot, chat_id: int, payer_name: str, amount: str, memo: str):
     await bot.send_photo(chat_id, png, caption=f"Gracias {payer_name} 🫶")
     EVENTS.push({"type":"donation","data":{"payer":payer_name,"amount":amount,"memo":memo},"ts":int(time.time())})
 
-# ============== helpers ==============
 def env_admin_set() -> set[str]:
     return set(str(x).strip() for x in ADMIN_USER_IDS.split(",") if x.strip())
 def is_admin(uid: int) -> bool:
@@ -138,7 +134,7 @@ def kb_donaciones(user=None) -> InlineKeyboardMarkup:
         return base+q
     for name,price in STATE.get("prices",[]):
         rows.append([InlineKeyboardButton(f"{name} · {price} {CURRENCY}", url=url_for(price))])
-    q=f"?c={CURRENCY}"; 
+    q=f"?c={CURRENCY}"
     if uid: q+=f"&uid={uid}"
     if uname: q+=f"&uname={uname}"
     rows.append([InlineKeyboardButton("💝 Donar libre", url=base+q)])
@@ -148,11 +144,10 @@ def now() -> int: return int(time.time())
 
 def translate(txt: str, target: str) -> str:
     if not ENABLE_TRANSLATION or not txt.strip(): return txt
-    try:
-        return GoogleTranslator(source='auto', target=target).translate(txt)
+    try: return GoogleTranslator(source='auto', target=target).translate(txt)
     except Exception: return txt
 
-# ================= Handlers =================
+# ===== Handlers =====
 async def cmd_start(update: Update, ctx: CallbackContext):
     await update.message.reply_text(
         f"Hola {update.effective_user.first_name or ''} 👋\nAsistente de *{STATE['model_name']}*.",
@@ -162,7 +157,8 @@ async def cmd_menu(update: Update, ctx: CallbackContext):
     await update.message.reply_text("💝 Opciones de apoyo:", reply_markup=kb_donaciones(update.effective_user))
 
 async def cmd_whoami(update: Update, ctx: CallbackContext):
-    u=update.effective_user; await update.message.reply_text(f"Tu user_id: {u.id}\nUsername: @{u.username}" if u.username else f"Tu user_id: {u.id}\nUsername: (sin username)")
+    u=update.effective_user
+    await update.message.reply_text(f"Tu user_id: {u.id}\nUsername: @{u.username}" if u.username else f"Tu user_id: {u.id}\nUsername: (sin username)")
 
 async def cmd_admins(update: Update, ctx: CallbackContext):
     await update.message.reply_text("Admins (archivo): "+(", ".join(map(str,STATE.get('admins',[]))) or "—")
@@ -206,14 +202,22 @@ async def cmd_setlangs(update: Update, ctx: CallbackContext):
     if langs: STATE["langs"]=langs; save_state(STATE); await update.message.reply_text("✅ Idiomas: "+", ".join(langs))
     else: await update.message.reply_text("Usa: /setlangs de,en,es,pl")
 
+def parse_price_line(arg: str) -> Optional[tuple[str,float]]:
+    # acepta "Nombre · 7", "Nombre : 7", "Nombre - 7", "Nombre 7"
+    m = re.match(r"^(.*?)[\s·:\-]+(\d+(?:[.,]\d{1,2})?)\s*$", arg)
+    if not m: return None
+    name = m.group(1).strip()
+    val = float(m.group(2).replace(",", "."))    
+    return (name, val)
+
 async def cmd_addprice(update: Update, ctx: CallbackContext):
     if not await guard_admin(update): return
     arg=update.message.text.split(" ",1)[-1].strip()
-    if "·" not in arg: return await update.message.reply_text("Usa: /addprice Nombre · 7")
-    name,price=[s.strip() for s in arg.split("·",1)]
-    try: price=float(price)
-    except: return await update.message.reply_text("Precio inválido.")
-    STATE["prices"].append([name,price]); save_state(STATE); await update.message.reply_text("✅ Precio agregado.")
+    parsed = parse_price_line(arg)
+    if not parsed: return await update.message.reply_text("Usa: /addprice Nombre · 7")
+    name, price = parsed
+    STATE["prices"].append([name,price]); save_state(STATE)
+    await update.message.reply_text(f"✅ Agregado: {name} · {price} {CURRENCY}")
 
 async def cmd_delprice(update: Update, ctx: CallbackContext):
     if not await guard_admin(update): return
@@ -223,35 +227,35 @@ async def cmd_delprice(update: Update, ctx: CallbackContext):
 
 async def cmd_listprices(update: Update, ctx: CallbackContext):
     lines=[f"• {n} · {v} {CURRENCY}" for n,v in STATE.get("prices",[])]
-    await update.message.reply_text("Precios actuales:\n"+"\n".join(lines))
+    await update.message.reply_text("Precios actuales:\n"+"\n".join(lines) if lines else "Sin precios aún.")
 
-# --- Grupo: texto + auto-marketing + traducción ---
+# Grupo: texto + marketing + traducción
 async def on_group_text(update: Update, ctx: CallbackContext):
     chat_id = update.effective_chat.id
     u = update.effective_user
     txt = update.message.text or ""
-    # Auto-marketing: al detectar actividad, empuja menú cada 10 min máx.
+
+    # marketing (enfriamiento 10 min)
     if now() - STATE.get("last_push_ts",0) > 600:
         STATE["last_push_ts"]=now(); save_state(STATE)
         await ctx.bot.send_message(chat_id,
             f"💝 Apoya a *{STATE['model_name']}* y aparece en pantalla.",
             parse_mode=ParseMode.MARKDOWN, reply_markup=kb_donaciones())
-    # Traducción bidireccional (si está activo)
-    if ENABLE_TRANSLATION:
+
+    # traducción
+    if ENABLE_TRANSLATION and txt:
         model_id = STATE.get("model_id",0)
         if u and u.id == model_id:
-            # Modelo habla → traducir al primer idioma de la lista
             target = STATE.get("langs",["de"])[0]
             out = translate(txt, target)
             if out and out != txt:
                 await ctx.bot.send_message(chat_id, f"🌐 {target}: {out}")
         else:
-            # Usuario habla → traducir al español para la modelo
             out = translate(txt, "es")
             if out and out != txt:
                 await ctx.bot.send_message(chat_id, f"🌐 es: {out}")
 
-# --- LIVE start/end (grupo) ---
+# LIVE start/end (grupo)
 async def on_group_live_start(update: Update, ctx: CallbackContext):
     STATE["marketing_on"]=True; save_state(STATE)
     await ctx.bot.send_message(update.effective_chat.id, "🔴 LIVE detectado (grupo). Marketing activado.")
@@ -259,7 +263,7 @@ async def on_group_live_end(update: Update, ctx: CallbackContext):
     STATE["marketing_on"]=False; save_state(STATE)
     await ctx.bot.send_message(update.effective_chat.id, "⚫️ LIVE finalizado. Marketing detenido.")
 
-# --- LIVE start/end (canal) ---
+# LIVE start/end (canal)
 async def on_channel_live_start(update: Update, ctx: CallbackContext):
     STATE["marketing_on"]=True; save_state(STATE)
     await ctx.bot.send_message(CHANNEL_ID, "🔴 LIVE detectado (canal). Marketing activado.")
@@ -267,7 +271,7 @@ async def on_channel_live_end(update: Update, ctx: CallbackContext):
     STATE["marketing_on"]=False; save_state(STATE)
     await ctx.bot.send_message(CHANNEL_ID, "⚫️ LIVE finalizado. Marketing detenido.")
 
-# ================= Web (Flask) =================
+# ===== Web (Flask) =====
 web = Flask(__name__)
 
 @web.get("/")
@@ -308,15 +312,15 @@ def studio_page():
     return f"""<!doctype html><meta charset="utf-8">
 <h2>Studio – {STATE.get('model_name')}</h2>
 <p><a href="{BASE_URL}/overlay" target="_blank">Abrir Overlay</a></p>
-<form method="post" action="{BASE_URL}/studio/ding"><button>🔔 Probar sonido</button></form>"""
+<form method="post" action="{BASE_URL}/studio/ding"><button>🔔 Probar sonido</button></form>
+<p>Si el botón no funciona en tu navegador, prueba aquí: <a href="{BASE_URL}/studio/ding">/studio/ding</a></p>"""
 
-@web.post("/studio/ding")
+@web.route("/studio/ding", methods=["GET","POST"])
 def studio_ding():
     EVENTS.push({"type":"donation","data":{"payer":"TestUser","amount":"0.00","memo":"Test"}, "ts":now()})
     return "<p>OK (revisa el Overlay).</p>"
 
 def _parse_amount(amt: str) -> Optional[int]:
-    # devuelve centavos (int) o None
     if not amt: return None
     amt = amt.replace(",", ".").strip()
     if not re.match(r"^\d+(\.\d{1,2})?$", amt): return None
@@ -330,7 +334,6 @@ def donate_page():
     title = f"Apoyo a {STATE.get('model_name')}"
     cents = _parse_amount(amt)
     if cents is None:
-        # formulario simple si falta o es inválido
         base = f"{BASE_URL}/donar?c={ccy}"
         if uid: base += f"&uid={uid}"
         if uname: base += f"&uname={uname}"
@@ -339,8 +342,7 @@ def donate_page():
 <input type="hidden" name="c" value="{ccy}">
 <input type="hidden" name="uid" value="{uid}"><input type="hidden" name="uname" value="{uname}">
 <label>Monto ({ccy}): <input name="amt" placeholder="5"></label>
-<button>Pagar</button>
-</form>"""
+<button>Pagar</button></form>"""
     session = stripe.checkout.Session.create(
         mode="payment",
         line_items=[{"price_data":{"currency":ccy.lower(), "product_data":{"name":title},
@@ -381,7 +383,7 @@ def stripe_webhook():
         )
     return ("",200)
 
-# ================= Arranque =================
+# ===== Arranque =====
 def run_flask(): web.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 def main():
@@ -400,12 +402,10 @@ def main():
     app.add_handler(CommandHandler("delprice", cmd_delprice))
     app.add_handler(CommandHandler("listprices", cmd_listprices))
 
-    # Grupo
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT, on_group_text))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.VIDEO_CHAT_STARTED, on_group_live_start))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.VIDEO_CHAT_ENDED, on_group_live_end))
 
-    # Canal
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL & filters.StatusUpdate.VIDEO_CHAT_STARTED, on_channel_live_start))
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL & filters.StatusUpdate.VIDEO_CHAT_ENDED, on_channel_live_end))
 
