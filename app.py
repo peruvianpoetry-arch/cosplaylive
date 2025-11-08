@@ -1,245 +1,247 @@
 import os, json, threading, asyncio
 from pathlib import Path
-from flask import Flask, request, Response
+from flask import Flask, request, Response, redirect, url_for
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
+# --- CONFIG ---
+TOKEN             = os.environ.get("TELEGRAM_TOKEN", "").strip()
+ADMIN_USER_ID     = int(os.environ.get("ADMIN_USER_ID", "0") or "0")
+DATA_DIR          = Path(os.environ.get("DATA_DIR", "/var/data"))
+ENABLE_TRANSLATION= os.environ.get("ENABLE_TRANSLATION", "1").lower() in ("1","true","yes","on")
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_FILE = DATA_DIR / "data.json"
+
+# ----- simple KV store -----
+def load_db():
+    if DB_FILE.exists():
+        try:
+            return json.loads(DB_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {
+        "prices":[
+            {"name":"name","price":0},
+            {"name":"name","price":0},
+            {"name":"name","price":0},
+            {"name":"name","price":0},
+        ],
+        "live": False
+    }
+
+def save_db(db): DB_FILE.write_text(json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
+
+db = load_db()
+
+# ----- Telegram bot -----
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters
+    Application, CommandHandler, MessageHandler, CallbackContext, filters
 )
 
-# ----------------- Persistencia -----------------
-DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data")); DATA_DIR.mkdir(parents=True, exist_ok=True)
-DATA_FILE = DATA_DIR / "data.json"
+def is_admin(user_id:int)->bool:
+    return ADMIN_USER_ID and user_id == ADMIN_USER_ID
 
-def load_data():
-    if DATA_FILE.exists():
-        try: return json.loads(DATA_FILE.read_text(encoding="utf-8"))
-        except Exception: pass
-    return {"admins": [], "prices": [], "model_name": "Cosplay Emma", "live": False, "group_id": None}
-
-def save_data(d): DATA_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
-DB = load_data()
-
-# ----------------- Traducción -----------------
-ENABLE_TRANSLATION = os.getenv("ENABLE_TRANSLATION", "true").lower() in ("1","true","yes")
-MODEL_ID = int(os.getenv("MODEL_ID", "0") or 0)
-if ENABLE_TRANSLATION:
-    from deep_translator import GoogleTranslator
-    tr_es = lambda s: GoogleTranslator(source='auto', target='es').translate(s)
-    tr_de = lambda s: GoogleTranslator(source='auto', target='de').translate(s)
-else:
-    tr_es = tr_de = lambda s: s
-
-# ----------------- Telegram -----------------
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-
-def app_singleton() -> Application:
-    global _APP
-    try: return _APP
-    except NameError:
-        _APP = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-        return _APP
-
-def is_admin(uid:int)->bool: return uid in DB["admins"]
-
-def need_admin(fn):
-    async def wrap(update:Update, context:ContextTypes.DEFAULT_TYPE):
-        uid = update.effective_user and update.effective_user.id
-        if not uid or not is_admin(uid):
-            await update.effective_chat.send_message("Solo admin.")
-            return
-        return await fn(update, context)
-    return wrap
-
-# ----------------- Menú de donaciones -----------------
-BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
-CURRENCY = os.getenv("CURRENCY", "EUR")
-
-def menu_markup(user=None):
+def prices_kb():
+    # botones con link al /donar?amt=XX
     rows=[]
-    uid=getattr(user,"id",""); uname=getattr(user,"username","")
-    def mkurl(amount=None):
-        u = f"{BASE_URL}/donar" if BASE_URL else "/donar"
-        q=[]
-        if amount is not None: q+= [f"amt={amount}"]
-        q+= [f"c={CURRENCY}"]
-        if uid: q+= [f"uid={uid}"]
-        if uname: q+= [f"uname={uname}"]
-        return u + "?" + "&".join(q)
-    for p in DB["prices"]:
-        rows.append([InlineKeyboardButton(f"{p['name']} · {p['price']} {CURRENCY}", url=mkurl(p["price"]))])
-    rows.append([InlineKeyboardButton("💝 Donar libre", url=mkurl(None))])
+    for item in db.get("prices", []):
+        name=item.get("name","name")
+        price=item.get("price",0)
+        label = f"{name} · {price} EUR" if price else f"{name} · price EUR"
+        rows.append([InlineKeyboardButton(text=label, url=f"{PUBLIC_BASE()}/donar?amt={price or ''}")])
+    rows.append([InlineKeyboardButton(text="💝 Donar libre", url=f"{PUBLIC_BASE()}/donar")])
     return InlineKeyboardMarkup(rows)
 
-async def post_menu(context, chat_id:int):
-    title = DB.get("model_name","Cosplay Emma")
-    await context.bot.send_message(chat_id, f"💖 Apoya a *{title}* y aparece en pantalla.", parse_mode=ParseMode.MARKDOWN, reply_markup=menu_markup())
+async def cmd_start(update: Update, ctx: CallbackContext):
+    await update.message.reply_text(
+        "Asistente de Cosplay Emma.\nComandos: /studio /liveon /liveoff /addprice /listprices /resetprices",
+        reply_markup=prices_kb()
+    )
 
-# --------- Eventos LIVE (grupo de discusión) ---------
-async def on_group_live_start(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    DB["live"]=True; DB["group_id"]=update.effective_chat.id; save_data(DB)
-    await post_menu(context, update.effective_chat.id)
+def PUBLIC_BASE():
+    # Render asigna una URL pública; si tienes un dominio propio, cámbialo aquí.
+    # Usa la cabecera Host cuando Flask sirve detrás de Render.
+    host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host") if request else None
+    if host: return f"https://{host}"
+    # fallback local
+    return f"http://localhost:{os.environ.get('PORT','10000')}"
 
-async def on_group_live_end(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    DB["live"]=False; save_data(DB)
-    await update.effective_chat.send_message("🔴 LIVE desactivado.")
+async def cmd_studio(update: Update, ctx: CallbackContext):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Solo admin.")
+        return
+    await update.message.reply_text(f"Studio: {PUBLIC_BASE()}/studio")
 
-# ----------------- Comandos -----------------
-async def start_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    title = DB.get("model_name","Cosplay Emma")
-    text = (f"Hola, soy el asistente de *{title}*.\n\n"
-            "Comandos:\n"
-            "• /start, /menu, /whoami\n"
-            "• /iamadmin – hacerte admin\n"
-            "• /addprice Nombre · 7, /delprice Nombre, /listprices\n"
-            "• /setmodel Nombre\n"
-            "• /liveon /liveoff\n"
-            "• /studio – abrir panel/overlay")
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+async def cmd_liveon(update: Update, ctx: CallbackContext):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Solo admin.")
+        return
+    db["live"]=True; save_db(db)
+    await update.message.reply_text("🟢 LIVE activado.")
 
-async def studio_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    base = BASE_URL or f"https://{request.host}" if request else BASE_URL
-    base = base or "http://localhost:10000"
-    await update.message.reply_text(f"Panel: {base}/studio\nOverlay: {base}/overlay")
+async def cmd_liveoff(update: Update, ctx: CallbackContext):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Solo admin.")
+        return
+    db["live"]=False; save_db(db)
+    await update.message.reply_text("🔴 LIVE desactivado.")
 
-async def whoami(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    u=update.effective_user
-    await update.message.reply_text(f"Tu user_id: {u.id}\nUsername: @{u.username or '—'}")
-
-async def iamadmin(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    uid=update.effective_user.id
-    if uid not in DB["admins"]:
-        DB["admins"].append(uid); save_data(DB)
-    await update.message.reply_text("✅ Ya eres admin de este bot.")
-
-@need_admin
-async def setmodel(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    name=" ".join(context.args).strip()
-    if not name:
-        await update.message.reply_text("Usa: /setmodel Nombre del modelo"); return
-    DB["model_name"]=name; save_data(DB)
-    await update.message.reply_text(f"OK. Modelo: {name}")
-
-@need_admin
-async def addprice(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    raw=" ".join(context.args).strip()
-    if not raw:
-        await update.message.reply_text("Usa: /addprice Nombre · 7"); return
-    for sep in ["·","-","|"]: raw=raw.replace(sep," ")
-    parts=[p for p in raw.split() if p]
-    try:
-        price=float(parts[-1].replace(",","."))
-        name=" ".join(parts[:-1]).strip(); assert name
-    except Exception:
-        await update.message.reply_text("Usa: /addprice Nombre · 7"); return
-    DB["prices"]=[p for p in DB["prices"] if p["name"].lower()!=name.lower()]
-    DB["prices"].append({"name":name,"price":price}); save_data(DB)
-    await update.message.reply_text(f"✅ Añadido: {name} · {price}")
-
-@need_admin
-async def delprice(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    name=" ".join(context.args).strip()
-    if not name: await update.message.reply_text("Usa: /delprice Nombre"); return
-    before=len(DB["prices"])
-    DB["prices"]=[p for p in DB["prices"] if p["name"].lower()!=name.lower()]
-    save_data(DB)
-    await update.message.reply_text("✅ Eliminado" if len(DB["prices"])<before else "No existía.")
-
-@need_admin
-async def listprices(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    if not DB["prices"]:
-        await update.message.reply_text("Sin precios. Usa /addprice Nombre · 7"); return
-    lines=[f"- {p['name']} · {p['price']}" for p in sorted(DB["prices"], key=lambda x:x["name"].lower())]
-    await update.message.reply_text("Precios:\n"+"\n".join(lines))
-
-async def menu_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("💝 Opciones de apoyo:", reply_markup=menu_markup(update.effective_user))
-
-@need_admin
-async def live_on(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    DB["live"]=True; DB["group_id"]=update.effective_chat.id; save_data(DB)
-    await update.message.reply_text("🟢 LIVE activado."); await post_menu(context, update.effective_chat.id)
-
-@need_admin
-async def live_off(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    DB["live"]=False; save_data(DB); await update.message.reply_text("🔴 LIVE desactivado.")
-
-# ---- Traducción en grupos ----
-async def on_group_text(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type not in ("group","supergroup"): return
-    if not DB.get("group_id"): DB["group_id"]=update.effective_chat.id; save_data(DB)
-    txt=update.effective_message.text or ""
-    if not txt or txt.startswith("/"): return
-    if not ENABLE_TRANSLATION: return
-    uid=update.effective_user.id if update.effective_user else 0
-    if uid==MODEL_ID and MODEL_ID!=0:
-        t=tr_de(txt)
-        if t.strip()!=txt.strip(): await update.effective_chat.send_message(f"🗣️ (DE) {t}")
+async def cmd_iamadmin(update: Update, ctx: CallbackContext):
+    if is_admin(update.effective_user.id):
+        await update.message.reply_text("✅ Ya eres admin de este bot.")
     else:
-        t=tr_es(txt)
-        if t.strip()!=txt.strip(): await update.effective_chat.send_message(f"👀 (ES) {t}")
+        await update.message.reply_text("No eres admin. (Revisa ADMIN_USER_ID).")
 
-# ----------------- Flask (Studio/Overlay/Donar) -----------------
-web = Flask(__name__)
+def parse_price_args(args:list[str]):
+    # Formatos aceptados:
+    #   /addprice Nombre  7
+    #   /addprice Nombre · 7
+    #   /addprice Nombre - 7
+    if not args: return None
+    txt=" ".join(args).strip()
+    for sep in ["·","-","|",":"]:
+        txt = txt.replace(f" {sep} ", " ")
+        txt = txt.replace(sep, " ")
+    parts = txt.split()
+    if len(parts)<2: return None
+    try:
+        price = float(parts[-1].replace(",", "."))
+    except:
+        return None
+    name  = " ".join(parts[:-1]).strip()
+    if not name: return None
+    return {"name":name, "price": price}
 
-@web.get("/")
-def home(): return "CosplayLive bot OK"
+async def cmd_addprice(update: Update, ctx: CallbackContext):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Solo admin.")
+        return
+    parsed = parse_price_args(ctx.args)
+    if not parsed:
+        await update.message.reply_text("Usa: /addprice Nombre · 7")
+        return
+    # añade o reemplaza por nombre (case-insensitive)
+    name_lower = parsed["name"].lower()
+    replaced=False
+    for it in db["prices"]:
+        if it["name"].lower()==name_lower:
+            it["price"]=parsed["price"]; replaced=True; break
+    if not replaced:
+        db["prices"].append(parsed)
+    save_db(db)
+    await update.message.reply_text("✅ Precio guardado.", reply_markup=prices_kb())
 
-@web.get("/studio")
+async def cmd_listprices(update: Update, ctx: CallbackContext):
+    text = "\n".join([f"- {p['name']} · {p['price']} EUR" for p in db.get("prices",[])]) or "(vacío)"
+    await update.message.reply_text(text, reply_markup=prices_kb())
+
+async def cmd_resetprices(update: Update, ctx: CallbackContext):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Solo admin.")
+        return
+    db["prices"]=[]
+    save_db(db)
+    await update.message.reply_text("✅ Lista de precios reiniciada.", reply_markup=prices_kb())
+
+# --- Traducción de mensajes del chat de discusión ---
+if ENABLE_TRANSLATION:
+    try:
+        from deep_translator import GoogleTranslator
+    except Exception:
+        GoogleTranslator=None
+else:
+    GoogleTranslator=None
+
+def tr(text:str, src='auto', to='es'):
+    if not GoogleTranslator: return text
+    try:
+        return GoogleTranslator(source=src, target=to).translate(text)
+    except Exception:
+        return text
+
+async def on_group_message(update: Update, ctx: CallbackContext):
+    """Responde con traducción ES<->DE según lo que detecte."""
+    msg = update.effective_message
+    if not msg or not msg.text: return
+    original = msg.text.strip()
+    # Para la modelo hispanohablante: traduce lo que escriben (a ES)
+    translated_to_es = tr(original, 'auto', 'es')
+    # y también publica una sugerencia al alemán para audiencia alemana
+    translated_to_de = tr(original, 'auto', 'de')
+    if translated_to_es != original:
+        await msg.reply_text(f"🇪🇸 {translated_to_es}")
+    if translated_to_de != original:
+        await msg.reply_text(f"🇩🇪 {translated_to_de}")
+
+# ===== Flask (overlay + pagos demo) =====
+flask_app = Flask(__name__)
+
+@flask_app.get("/")
+def index():
+    return "CosplayLive bot OK"
+
+@flask_app.get("/studio")
 def studio():
-    return """<h3>Studio – Cosplay Emma</h3>
-<p><a href="/overlay" target="_blank">Abrir Overlay</a></p>
-<p><a href="/studio/ding">🔔 Probar sonido</a> – OK</p>"""
+    return f"""<html><head><meta charset="utf-8">
+<title>Studio – Cosplay Emma</title></head>
+<body>
+<h3>Studio – Cosplay Emma</h3>
+<p><a href="{PUBLIC_BASE()}/overlay" target="_blank">Abrir Overlay</a></p>
+<p><a href="{PUBLIC_BASE()}/overlay?sound=1" target="_blank">Probar sonido</a></p>
+</body></html>"""
 
-@web.get("/overlay")
+@flask_app.get("/overlay")
 def overlay():
-    return Response("<html><body style='margin:0;background:#0b1220;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif'>Overlay listo</body></html>", mimetype="text/html")
+    # overlay muy simple (fondo + en el futuro: últimos pagos)
+    return """<html><head><meta charset="utf-8">
+<title>Overlay</title>
+<style>html,body{margin:0;height:100%;background:#0e1320;color:#fff;font-family:system-ui, sans-serif;}</style>
+</head><body></body></html>"""
 
-@web.get("/studio/ding")
-def studio_ding(): return "ding ok"
+@flask_app.get("/donar")
+def donar():
+    # /donar?amt=12.5
+    amt = (request.args.get("amt") or "").replace(",", ".")
+    try:
+        amount = float(amt) if amt else None
+    except:
+        amount = None
+    if amt and amount is None:
+        return Response("Monto inválido", mimetype="text/plain")
+    # En versión demo, solo confirma; la integración real con Stripe va aparte
+    return f"""<html><head><meta charset="utf-8"><title>Donar</title></head>
+<body>
+<h3>Gracias por apoyar ✨</h3>
+<p>Importe: {amount if amount is not None else 'libre'}</p>
+<p>(Demo) Cierra esta ventana y vuelve al chat.</p>
+</body></html>"""
 
-@web.get("/donar")
-def donate_page():
-    amt=(request.args.get("amt") or "").strip()
-    ccy=(request.args.get("c") or CURRENCY).upper()
-    if not (amt.replace(".","",1).isdigit() or amt.replace(",","",1).isdigit()):
-        return "Monto inválido"
-    return f"OK, {amt} {ccy} (demo)."
-
-# ----------------- Lanzadores -----------------
+# ===== Bot bootstrap en hilo propio =====
 def start_bot_in_thread():
-    # Crear y registrar event loop en ESTE hilo
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    def runner():
+        asyncio.set_event_loop(asyncio.new_event_loop())
+        application = Application.builder().token(TOKEN).build()
 
-    app = app_singleton()
-    # Handlers
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("studio", studio_cmd))
-    app.add_handler(CommandHandler("whoami", whoami))
-    app.add_handler(CommandHandler("iamadmin", iamadmin))
-    app.add_handler(CommandHandler("setmodel", setmodel))
-    app.add_handler(CommandHandler("addprice", addprice))
-    app.add_handler(CommandHandler("delprice", delprice))
-    app.add_handler(CommandHandler("listprices", listprices))
-    app.add_handler(CommandHandler("menu", menu_cmd))
-    app.add_handler(CommandHandler("liveon", live_on))
-    app.add_handler(CommandHandler("liveoff", live_off))
-    app.add_handler(MessageHandler(filters.StatusUpdate.VIDEO_CHAT_STARTED, on_group_live_start))
-    app.add_handler(MessageHandler(filters.StatusUpdate.VIDEO_CHAT_ENDED, on_group_live_end))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_group_text))
+        application.add_handler(CommandHandler("start",      cmd_start))
+        application.add_handler(CommandHandler("studio",     cmd_studio))
+        application.add_handler(CommandHandler("liveon",     cmd_liveon))
+        application.add_handler(CommandHandler("liveoff",    cmd_liveoff))
+        application.add_handler(CommandHandler("iamadmin",   cmd_iamadmin))
+        application.add_handler(CommandHandler("addprice",   cmd_addprice))
+        application.add_handler(CommandHandler("listprices", cmd_listprices))
+        application.add_handler(CommandHandler("resetprices",cmd_resetprices))
 
-    # Ejecutar bot en este hilo con su loop
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+        # Responder a cualquier texto en grupos / discusión (privacy OFF)
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_group_message))
 
-def run():
-    # Arrancar BOT en hilo con event loop propio
-    threading.Thread(target=start_bot_in_thread, name="bot-thread", daemon=True).start()
-    # Servidor web en el hilo principal (Render necesita el puerto)
-    port=int(os.getenv("PORT","10000"))
-    web.run(host="0.0.0.0", port=port)
+        # Ejecutar polling SIN señales (porque no estamos en el main thread)
+        application.run_polling(drop_pending_updates=True, stop_signals=None)
 
-if __name__=="__main__":
-    run()
+    t = threading.Thread(target=runner, name="bot_thread", daemon=True)
+    t.start()
+
+if __name__ == "__main__":
+    assert TOKEN, "Falta TELEGRAM_TOKEN"
+    start_bot_in_thread()
+    port = int(os.environ.get("PORT", "10000"))
+    flask_app.run(host="0.0.0.0", port=port, threaded=True)
