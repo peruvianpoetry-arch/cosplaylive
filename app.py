@@ -1,4 +1,4 @@
-import os, json, threading
+import os, json, threading, asyncio
 from pathlib import Path
 from flask import Flask, request, Response
 
@@ -9,22 +9,20 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
-# -------- Persistencia básica --------
+# ----------------- Persistencia -----------------
 DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data")); DATA_DIR.mkdir(parents=True, exist_ok=True)
 DATA_FILE = DATA_DIR / "data.json"
 
 def load_data():
     if DATA_FILE.exists():
-        try:
-            return json.loads(DATA_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        try: return json.loads(DATA_FILE.read_text(encoding="utf-8"))
+        except Exception: pass
     return {"admins": [], "prices": [], "model_name": "Cosplay Emma", "live": False, "group_id": None}
 
 def save_data(d): DATA_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
 DB = load_data()
 
-# -------- Traducción --------
+# ----------------- Traducción -----------------
 ENABLE_TRANSLATION = os.getenv("ENABLE_TRANSLATION", "true").lower() in ("1","true","yes")
 MODEL_ID = int(os.getenv("MODEL_ID", "0") or 0)
 if ENABLE_TRANSLATION:
@@ -34,7 +32,7 @@ if ENABLE_TRANSLATION:
 else:
     tr_es = tr_de = lambda s: s
 
-# -------- Telegram --------
+# ----------------- Telegram -----------------
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 
 def app_singleton() -> Application:
@@ -55,7 +53,7 @@ def need_admin(fn):
         return await fn(update, context)
     return wrap
 
-# -------- Botones de donación --------
+# ----------------- Menú de donaciones -----------------
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 CURRENCY = os.getenv("CURRENCY", "EUR")
 
@@ -79,7 +77,7 @@ async def post_menu(context, chat_id:int):
     title = DB.get("model_name","Cosplay Emma")
     await context.bot.send_message(chat_id, f"💖 Apoya a *{title}* y aparece en pantalla.", parse_mode=ParseMode.MARKDOWN, reply_markup=menu_markup())
 
-# -------- Eventos LIVE en grupo --------
+# --------- Eventos LIVE (grupo de discusión) ---------
 async def on_group_live_start(update:Update, context:ContextTypes.DEFAULT_TYPE):
     DB["live"]=True; DB["group_id"]=update.effective_chat.id; save_data(DB)
     await post_menu(context, update.effective_chat.id)
@@ -88,22 +86,22 @@ async def on_group_live_end(update:Update, context:ContextTypes.DEFAULT_TYPE):
     DB["live"]=False; save_data(DB)
     await update.effective_chat.send_message("🔴 LIVE desactivado.")
 
-# --------- Comandos (DM y grupo) ----------
+# ----------------- Comandos -----------------
 async def start_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     title = DB.get("model_name","Cosplay Emma")
     text = (f"Hola, soy el asistente de *{title}*.\n\n"
-            "Comandos útiles:\n"
-            "• /whoami – ver tu ID\n"
-            "• /iamadmin – hacerte admin del bot\n"
-            "• /menu – ver botones de apoyo\n"
-            "• /addprice Nombre · 7 – agregar precio (solo admin)\n"
-            "• /listprices – listar precios\n"
-            "• /liveon /liveoff – forzar estado (solo admin)\n"
+            "Comandos:\n"
+            "• /start, /menu, /whoami\n"
+            "• /iamadmin – hacerte admin\n"
+            "• /addprice Nombre · 7, /delprice Nombre, /listprices\n"
+            "• /setmodel Nombre\n"
+            "• /liveon /liveoff\n"
             "• /studio – abrir panel/overlay")
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 async def studio_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    base = BASE_URL or "https://"+request.host if request else ""
+    base = BASE_URL or f"https://{request.host}" if request else BASE_URL
+    base = base or "http://localhost:10000"
     await update.message.reply_text(f"Panel: {base}/studio\nOverlay: {base}/overlay")
 
 async def whoami(update:Update, context:ContextTypes.DEFAULT_TYPE):
@@ -168,7 +166,7 @@ async def live_on(update:Update, context:ContextTypes.DEFAULT_TYPE):
 async def live_off(update:Update, context:ContextTypes.DEFAULT_TYPE):
     DB["live"]=False; save_data(DB); await update.message.reply_text("🔴 LIVE desactivado.")
 
-# ---- Traducción SOLO en grupos ----
+# ---- Traducción en grupos ----
 async def on_group_text(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type not in ("group","supergroup"): return
     if not DB.get("group_id"): DB["group_id"]=update.effective_chat.id; save_data(DB)
@@ -183,7 +181,7 @@ async def on_group_text(update:Update, context:ContextTypes.DEFAULT_TYPE):
         t=tr_es(txt)
         if t.strip()!=txt.strip(): await update.effective_chat.send_message(f"👀 (ES) {t}")
 
-# -------- Flask (Studio/Overlay/Donar) --------
+# ----------------- Flask (Studio/Overlay/Donar) -----------------
 web = Flask(__name__)
 
 @web.get("/")
@@ -210,10 +208,14 @@ def donate_page():
         return "Monto inválido"
     return f"OK, {amt} {ccy} (demo)."
 
-# -------- Lanzadores --------
-def start_polling():
-    app=app_singleton()
-    # DM y grupo
+# ----------------- Lanzadores -----------------
+def start_bot_in_thread():
+    # Crear y registrar event loop en ESTE hilo
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    app = app_singleton()
+    # Handlers
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("studio", studio_cmd))
     app.add_handler(CommandHandler("whoami", whoami))
@@ -225,15 +227,19 @@ def start_polling():
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("liveon", live_on))
     app.add_handler(CommandHandler("liveoff", live_off))
-    # Auto-LIVE
     app.add_handler(MessageHandler(filters.StatusUpdate.VIDEO_CHAT_STARTED, on_group_live_start))
     app.add_handler(MessageHandler(filters.StatusUpdate.VIDEO_CHAT_ENDED, on_group_live_end))
-    # Traducción en grupo
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_group_text))
+
+    # Ejecutar bot en este hilo con su loop
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 def run():
-    threading.Thread(target=start_polling, daemon=True).start()
-    port=int(os.getenv("PORT","10000")); web.run(host="0.0.0.0", port=port)
+    # Arrancar BOT en hilo con event loop propio
+    threading.Thread(target=start_bot_in_thread, name="bot-thread", daemon=True).start()
+    # Servidor web en el hilo principal (Render necesita el puerto)
+    port=int(os.getenv("PORT","10000"))
+    web.run(host="0.0.0.0", port=port)
 
-if __name__=="__main__": run()
+if __name__=="__main__":
+    run()
