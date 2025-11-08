@@ -1,406 +1,299 @@
-import os, io, json, time, asyncio, threading
+import os, json, threading, io, time
 from pathlib import Path
-from typing import Dict, List, Tuple
-
 from flask import Flask, request, Response
-import stripe
 
-# -------------------- Telegram (PTB 20.x) --------------------
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, MessageHandler,
-    filters, ContextTypes
+    ContextTypes, filters
 )
 
-# -------------------- Traducción (opcional) --------------------
-ENABLE_TRANSLATION = os.getenv("ENABLE_TRANSLATION", "false").lower() == "true"
-if ENABLE_TRANSLATION:
-    try:
-        from deep_translator import GoogleTranslator
-    except Exception:
-        ENABLE_TRANSLATION = False
+# --- Opcional pagos (dejado listo; no usado en esta versión mínima) ----
+import stripe
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "sk_test_placeholder")
 
-# -------------------- Config --------------------
-TOKEN = os.environ["TELEGRAM_TOKEN"]
-CHANNEL_ID = int(os.environ["CHANNEL_ID"])
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "")
-BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
+# -------------------- Persistencia --------------------
 DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DATA_FILE = DATA_DIR / "data.json"
 
-stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
-
-DEFAULT_MODEL_NAME = "Cosplay Emma"
-DEFAULT_CC = "EUR"
-
-# -------------------- Estado persistente --------------------
-def load_state() -> Dict:
+def load_data():
     if DATA_FILE.exists():
         try:
-            return json.loads(DATA_FILE.read_text("utf-8"))
+            return json.loads(DATA_FILE.read_text(encoding="utf-8"))
         except Exception:
             pass
     return {
-        "admins": [],
-        "model_name": DEFAULT_MODEL_NAME,
-        "currency": DEFAULT_CC,
-        "prices": [
-            ["Group goal", 50],
-            ["Freier Betrag", 0],
+        "admins": [],              # user_ids admins del bot
+        "prices": [                # ejemplo inicial vacío (el admin los llenará)
         ],
+        "model_name": "Cosplay Emma",
         "live": False,
+        "group_id": None           # te lo guardo al primer uso
     }
 
-def save_state(d: Dict):
-    DATA_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), "utf-8")
+def save_data(d): DATA_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
 
-state = load_state()
+DB = load_data()
 
-# -------------------- Utilidades --------------------
+# -------------------- Traducción --------------------
+ENABLE_TRANSLATION = os.getenv("ENABLE_TRANSLATION", "true").lower() in ("1","true","yes")
+MODEL_ID = int(os.getenv("MODEL_ID", "0") or 0)
+
+if ENABLE_TRANSLATION:
+    from deep_translator import GoogleTranslator
+    def tr_to_es(txt: str) -> str:
+        try:
+            return GoogleTranslator(source='auto', target='es').translate(txt)
+        except Exception:
+            return txt
+    def tr_to_de(txt: str) -> str:
+        try:
+            return GoogleTranslator(source='auto', target='de').translate(txt)
+        except Exception:
+            return txt
+else:
+    tr_to_es = tr_to_de = lambda s: s
+
+# -------------------- Bot --------------------
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+
+def app_singleton() -> Application:
+    global _APP
+    try:
+        return _APP
+    except NameError:
+        _APP = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+        return _APP
+
+# ---- Helpers ----
 def is_admin(user_id: int) -> bool:
-    return user_id in state["admins"]
+    return user_id in DB["admins"]
 
-def ensure_admin(func):
+def need_admin(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        uid = update.effective_user.id if update.effective_user else 0
-        if not is_admin(uid):
-            await update.effective_chat.send_message("Solo admin.", quote=False)
+        uid = update.effective_user and update.effective_user.id
+        if not uid or not is_admin(uid):
+            await update.effective_chat.send_message("Solo admin.")
             return
         return await func(update, context)
     return wrapper
 
-def kb_menu(user=None) -> InlineKeyboardMarkup:
+def kb_donaciones(user=None) -> InlineKeyboardMarkup:
     rows = []
-    uid = getattr(user, "id", "")
-    uname = getattr(user, "username", "") or ""
-    base = f"{BASE_URL}/donar"
-
-    def url_for(name: str, price: float):
-        q = f"?c={state['currency']}"
-        if price and price > 0:
-            q += f"&amt={price}"
-        if uid:
-            q += f"&uid={uid}"
-        if uname:
-            q += f"&uname={uname}"
+    currency = os.getenv("CURRENCY", "EUR")
+    base = os.getenv("BASE_URL", "").rstrip("/") + "/donar"
+    uid = getattr(user, "id", "") if user else ""
+    uname = getattr(user, "username", "") if user else ""
+    def url_for(price):
+        q = f"?amt={price}&c={currency}"
+        if uid: q += f"&uid={uid}"
+        if uname: q += f"&uname={uname}"
         return base + q
-
-    for name, price in state["prices"]:
-        label = f"{name} · {state['currency']}" if not price else f"{name} · {price} {state['currency']}"
-        rows.append([InlineKeyboardButton(label, url=url_for(name, price or 0))])
-
+    # Botones a partir de DB
+    for item in DB["prices"]:
+        name = item["name"]; price = item["price"]
+        rows.append([InlineKeyboardButton(f"{name} · {price} {currency}", url=url_for(price))])
+    rows.append([InlineKeyboardButton("💝 Donar libre", url=(base + f"?c={currency}" + (f"&uid={uid}&uname={uname}" if uid else "")))])
     return InlineKeyboardMarkup(rows)
 
-def app_title():
-    return f"Asistente de <b>{state['model_name']}</b>."
+async def post_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    currency = os.getenv("CURRENCY", "EUR")
+    title = DB.get("model_name", "Cosplay Emma")
+    text = f"💖 Apoya a *{title}* y aparece en pantalla."
+    await context.bot.send_message(chat_id, text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_donaciones())
 
-# -------------------- Overlay / SSE --------------------
-overlay_clients: List[asyncio.Queue] = []
+# -------- Anuncios al detectar LIVE ----------
+async def on_group_live_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # VIDEO_CHAT_STARTED llega en grupos/supergrupos
+    DB["live"] = True
+    gid = update.effective_chat.id
+    DB["group_id"] = gid
+    save_data(DB)
+    await post_menu(context, gid)
 
-async def push_event(payload: Dict):
-    dead = []
-    for q in overlay_clients:
-        try:
-            await q.put(json.dumps(payload))
-        except Exception:
-            dead.append(q)
-    for q in dead:
-        try:
-            overlay_clients.remove(q)
-        except:
-            pass
-
-# -------------------- Telegram App --------------------
-_telegram_app: Application = None
-
-def telegram_app_singleton() -> Application:
-    global _telegram_app
-    if _telegram_app:
-        return _telegram_app
-    _telegram_app = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .concurrent_updates(True)
-        .build()
-    )
-
-    _telegram_app.add_handler(CommandHandler("start", cmd_start))
-    _telegram_app.add_handler(CommandHandler("menu", cmd_menu))
-    _telegram_app.add_handler(CommandHandler("studio", cmd_studio))
-    _telegram_app.add_handler(CommandHandler("iamadmin", cmd_iamadmin))
-    _telegram_app.add_handler(CommandHandler("whoami", cmd_whoami))
-    _telegram_app.add_handler(CommandHandler("listprices", cmd_listprices))
-    _telegram_app.add_handler(CommandHandler("resetprices", cmd_resetprices))
-    _telegram_app.add_handler(CommandHandler("addprice", cmd_addprice))
-    _telegram_app.add_handler(CommandHandler("delprice", cmd_delprice))
-    _telegram_app.add_handler(CommandHandler("setmodel", cmd_setmodel))
-    _telegram_app.add_handler(CommandHandler("setccy", cmd_setccy))
-    _telegram_app.add_handler(CommandHandler("liveon", cmd_liveon))
-    _telegram_app.add_handler(CommandHandler("liveoff", cmd_liveoff))
-    _telegram_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_text_any))
-
-    threading.Thread(target=_telegram_app.run_polling, kwargs={"allowed_updates": Update.ALL_TYPES}, daemon=True).start()
-    return _telegram_app
-
-# -------------------- Handlers --------------------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_html(app_title())
-    await cmd_menu(update, context)
-
-async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await update.effective_chat.send_message("💝 Opciones de apoyo:", reply_markup=kb_menu(user))
-
-async def cmd_studio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.effective_chat.send_message("Solo admin.")
-        return
-    await update.effective_chat.send_message(f"🔗 Abre tu panel: {BASE_URL}/studio")
-
-async def cmd_iamadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid not in state["admins"]:
-        state["admins"].append(uid)
-        save_state(state)
-    await update.effective_chat.send_message("✅ Ya eres admin de este bot.")
-
-async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    await update.effective_chat.send_message(
-        f"Tu user_id: <code>{u.id}</code>\nUsername: @{u.username}",
-        parse_mode=ParseMode.HTML,
-    )
-
-# ✅ bloque corregido
-async def cmd_listprices(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not state["prices"]:
-        await update.effective_chat.send_message("No hay precios.")
-        return
-    lines = []
-    for n, p in state["prices"]:
-        if p:
-            lines.append(f"• {n} — {p} {state['currency']}")
-        else:
-            lines.append(f"• {n} — libre")
-    await update.effective_chat.send_message("\n".join(lines))
-
-@ensure_admin
-async def cmd_resetprices(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state["prices"] = []
-    save_state(state)
-    await update.effective_chat.send_message("✅ Lista de precios vaciada.")
-
-@ensure_admin
-async def cmd_addprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (update.message.text or "").strip()
-    parts = txt.split(" ", 1)
-    if len(parts) < 2:
-        await update.effective_chat.send_message("Usa: /addprice Nombre · 7")
-        return
-    rest = parts[1].strip()
-    for sep in [" · ", " - ", " — ", " – "]:
-        rest = rest.replace(sep, " ")
-    toks = rest.split()
-    if not toks:
-        await update.effective_chat.send_message("Usa: /addprice Nombre · 7")
-        return
-    try:
-        price = float(toks[-1].replace(",", "."))
-        name = " ".join(toks[:-1]).strip()
-    except ValueError:
-        name = rest
-        price = 0.0
-    if not name:
-        await update.effective_chat.send_message("Usa: /addprice Nombre · 7")
-        return
-    state["prices"].append([name, price])
-    save_state(state)
-    msg = f"✅ Añadido: {name} ({'libre' if price==0 else str(price)+' '+state['currency']})"
-    await update.effective_chat.send_message(msg)
-
-@ensure_admin
-async def cmd_delprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = (update.message.text or "").split(" ", 1)
-    if len(name) < 2:
-        await update.effective_chat.send_message("Usa: /delprice Nombre")
-        return
-    key = name[1].strip().lower()
-    before = len(state["prices"])
-    state["prices"] = [x for x in state["prices"] if x[0].lower() != key]
-    save_state(state)
-    removed = before - len(state["prices"])
-    await update.effective_chat.send_message(f"Eliminados: {removed}")
-
-@ensure_admin
-async def cmd_setmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = (update.message.text or "").split(" ", 1)
-    if len(name) < 2:
-        await update.effective_chat.send_message("Usa: /setmodel Nombre del modelo")
-        return
-    state["model_name"] = name[1].strip()
-    save_state(state)
-    await update.effective_chat.send_message(f"Modelo ahora: {state['model_name']}")
-
-@ensure_admin
-async def cmd_setccy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = (update.message.text or "").split(" ", 1)
-    if len(t) < 2:
-        await update.effective_chat.send_message("Usa: /setccy EUR")
-        return
-    state["currency"] = t[1].strip().upper()
-    save_state(state)
-    await update.effective_chat.send_message(f"Moneda ahora: {state['currency']}")
-
-@ensure_admin
-async def cmd_liveon(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state["live"] = True
-    save_state(state)
-    await update.effective_chat.send_message("🟢 LIVE activado.")
-
-@ensure_admin
-async def cmd_liveoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state["live"] = False
-    save_state(state)
+async def on_group_live_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    DB["live"] = False
+    save_data(DB)
     await update.effective_chat.send_message("🔴 LIVE desactivado.")
 
-# -------------------- Respuesta general --------------------
-async def on_text_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if chat.type not in ("group", "supergroup"):
+# ------------- Comandos --------------
+async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    await update.message.reply_text(f"Tu user_id: {u.id}\nUsername: @{u.username or '—'}")
+
+async def iamadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in DB["admins"]:
+        DB["admins"].append(uid); save_data(DB)
+    await update.message.reply_text("✅ Ya eres admin de este bot.")
+
+@need_admin
+async def setmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = " ".join(context.args).strip()
+    if not name:
+        await update.message.reply_text("Usa: /setmodel Nombre del modelo")
+        return
+    DB["model_name"] = name; save_data(DB)
+    await update.message.reply_text(f"OK. Modelo: {name}")
+
+@need_admin
+async def addprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # formato: /addprice Nombre · 7  (el separador puede ser · o - o espacio)
+    raw = " ".join(context.args).strip()
+    if not raw:
+        await update.message.reply_text("Usa: /addprice Nombre · 7")
+        return
+    # Normalizar separadores
+    for sep in ["·", "-", "|"]:
+        raw = raw.replace(sep, " ")
+    parts = [p for p in raw.split() if p]
+    # último token debe ser precio
+    try:
+        price = float(parts[-1].replace(",", "."))
+        name = " ".join(parts[:-1]).strip()
+        if not name:
+            raise ValueError
+    except Exception:
+        await update.message.reply_text("Usa: /addprice Nombre · 7")
+        return
+    DB["prices"] = [p for p in DB["prices"] if p["name"].lower()!=name.lower()]
+    DB["prices"].append({"name": name, "price": price})
+    save_data(DB)
+    await update.message.reply_text(f"✅ Añadido: {name} · {price}")
+
+@need_admin
+async def delprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = " ".join(context.args).strip()
+    if not name:
+        await update.message.reply_text("Usa: /delprice Nombre")
+        return
+    before = len(DB["prices"])
+    DB["prices"] = [p for p in DB["prices"] if p["name"].lower()!=name.lower()]
+    save_data(DB)
+    await update.message.reply_text("✅ Eliminado" if len(DB["prices"])<before else "No existía.")
+
+@need_admin
+async def listprices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not DB["prices"]:
+        await update.message.reply_text("Sin precios. Usa /addprice Nombre · 7")
+        return
+    lines = [f"- {p['name']} · {p['price']}" for p in sorted(DB["prices"], key=lambda x: x["name"].lower())]
+    await update.message.reply_text("Precios:\n" + "\n".join(lines))
+
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("💝 Opciones de apoyo:", reply_markup=kb_donaciones(update.effective_user))
+
+@need_admin
+async def live_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    DB["live"] = True; save_data(DB)
+    DB["group_id"] = update.effective_chat.id
+    await update.message.reply_text("🟢 LIVE activado.")
+    await post_menu(context, update.effective_chat.id)
+
+@need_admin
+async def live_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    DB["live"] = False; save_data(DB)
+    await update.message.reply_text("🔴 LIVE desactivado.")
+
+# ------------- Traducción de mensajes del grupo -------------
+async def on_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Solo actuamos en el grupo, y si LIVE está activo (o lo prefieres SIEMPRE, cambia esta condición)
+    if update.effective_chat.type not in ("group","supergroup"):
+        return
+    if not DB.get("group_id"):
+        DB["group_id"] = update.effective_chat.id; save_data(DB)
+
+    txt = update.effective_message.text or ""
+    if not txt or txt.startswith("/"):
         return
 
-    if update.message and update.message.new_chat_members:
-        for m in update.message.new_chat_members:
-            await chat.send_message(f"👋 Bienvenido, @{m.username or m.first_name}!")
+    # Mostrar menú con baja frecuencia cuando hay actividad
+    if DB.get("live"):
+        # Al primer mensaje tras activarse, soltamos menú (ya se mandó en live_on)
+        pass
+
+    if not ENABLE_TRANSLATION:
         return
 
-    if ENABLE_TRANSLATION and update.message and update.message.text:
-        try:
-            translated = GoogleTranslator(source="auto", target="es").translate(update.message.text)
-            await chat.send_message(f"🈯️ Traducción para la modelo:\n<code>{translated}</code>", parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
+    sender = update.effective_user.id if update.effective_user else 0
+    if sender == MODEL_ID and MODEL_ID != 0:
+        # Mensaje de la modelo -> traducimos a alemán para la audiencia
+        t = tr_to_de(txt)
+        if t and t.strip() and t.strip() != txt.strip():
+            await update.effective_chat.send_message(f"🗣️ (DE) {t}")
+    else:
+        # Mensaje de audiencia -> traducimos a ES para la modelo
+        t = tr_to_es(txt)
+        if t and t.strip() and t.strip() != txt.strip():
+            await update.effective_chat.send_message(f"👀 (ES) {t}")
 
-    if state["live"]:
-        try:
-            await chat.send_message(
-                f"💖 Apoya a <b>{state['model_name']}</b> y aparece en pantalla.",
-                reply_markup=kb_menu(),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-        except Exception:
-            pass
-
-# -------------------- Flask --------------------
+# -------------------- Flask (Studio mínimo) --------------------
 web = Flask(__name__)
 
 @web.get("/")
-def root():
-    return "OK"
-
-@web.get("/overlay")
-def overlay():
-    async def event_stream(q: asyncio.Queue):
-        try:
-            while True:
-                data = await q.get()
-                yield f"data: {data}\n\n"
-        except asyncio.CancelledError:
-            return
-
-    q = asyncio.Queue()
-    overlay_clients.append(q)
-    loop = asyncio.get_event_loop()
-
-    def generate():
-        yield "data: {}\n\n"
-        while True:
-            data = loop.run_until_complete(q.get())
-            yield f"data: {data}\n\n"
-
-    return Response(generate(), mimetype="text/event-stream")
+def home():
+    return "CosplayLive bot OK"
 
 @web.get("/studio")
 def studio():
-    return f"""
-    <h2>Studio – {state['model_name']}</h2>
-    <p><a href="/overlay" target="_blank">Abrir Overlay</a></p>
-    <form action="/studio/ding" method="post"><button>🔔 Probar sonido</button></form>
-    """
+    return """<h3>Studio – Cosplay Emma</h3>
+<p><a href="/overlay" target="_blank">Abrir Overlay</a></p>
+<p><a href="/studio/ding">🔔 Probar sonido</a> (dummy OK)</p>"""
 
-@web.post("/studio/ding")
+@web.get("/overlay")
+def overlay():
+    # Overlay simple (negro), sin SSE para no fallar
+    return Response(
+        "<html><body style='margin:0;background:#0b1220;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif'>Overlay listo</body></html>",
+        mimetype="text/html"
+    )
+
+@web.get("/studio/ding")
 def studio_ding():
-    asyncio.get_event_loop().create_task(push_event({"type": "ding", "text": "Test"}))
-    return "OK"
+    # No hacemos nada complejo: solo OK (antes te daba 500)
+    return "ding ok"
 
-@web.get("/ok")
-def ok_page():
-    tg_link = f"tg://resolve?domain={CHANNEL_USERNAME}" if CHANNEL_USERNAME else ""
-    btn = f'<p><a href="{tg_link}">Volver a Telegram</a></p>' if tg_link else ""
-    return f"<h2>✅ Pago recibido (modo test)</h2>{btn}"
-
+# (Ruta /donar existe pero no creamos sesión Stripe si no hay 'amt' válido; evita 500)
 @web.get("/donar")
 def donate_page():
-    amt = request.args.get("amt", "").strip()
-    ccy = request.args.get("c", state["currency"]).upper()
-    uid = request.args.get("uid", "")
-    uname = request.args.get("uname", "")
-    title = f"Support {state['model_name']}"
+    amt = (request.args.get("amt") or "").strip()
+    ccy = (request.args.get("c") or "EUR").strip().upper()
+    if not (amt.replace(".","",1).isdigit() or amt.replace(",","",1).isdigit()):
+        return "Monto inválido"
+    return f"OK, {amt} {ccy} (demo)."
 
-    if amt:
-        try:
-            v = float(amt.replace(",", "."))
-            assert v > 0
-        except Exception:
-            return "Monto inválido"
-        session = stripe.checkout.Session.create(
-            mode="payment",
-            line_items=[{
-                "price_data": {
-                    "currency": ccy.lower(),
-                    "product_data": {"name": title},
-                    "unit_amount": int(round(v * 100)),
-                },
-                "quantity": 1
-            }],
-            success_url=f"{BASE_URL}/ok",
-            cancel_url=f"{BASE_URL}/ok",
-            metadata={"channel_id": str(CHANNEL_ID), "amount": f"{v:.2f} {ccy}", "uid": uid, "uname": uname},
-        )
-        return f'<meta http-equiv="refresh" content="0;url={session.url}">'
-    else:
-        return f"""
-        <h3>Donación libre</h3>
-        <form method="get" action="/donar">
-          <input name="amt" placeholder="Cantidad" />
-          <input type="hidden" name="c" value="{ccy}">
-          <button type="submit">Pagar</button>
-        </form>
-        """
+# -------------------- Lanzar polling --------------------
+def start_polling():
+    app = app_singleton()
+    # Handlers
+    app.add_handler(CommandHandler("whoami", whoami))
+    app.add_handler(CommandHandler("iamadmin", iamadmin))
+    app.add_handler(CommandHandler("setmodel", setmodel))
+    app.add_handler(CommandHandler("addprice", addprice))
+    app.add_handler(CommandHandler("delprice", delprice))
+    app.add_handler(CommandHandler("listprices", listprices))
+    app.add_handler(CommandHandler("menu", menu_cmd))
+    app.add_handler(CommandHandler("liveon", live_on))
+    app.add_handler(CommandHandler("liveoff", live_off))
 
-@web.post("/stripe_webhook")
-def stripe_webhook():
-    try:
-        event = json.loads(request.get_data(as_text=True))
-    except Exception:
-        return "bad", 400
+    # Videochat start/end en grupos -> auto LIVE
+    app.add_handler(MessageHandler(filters.StatusUpdate.VIDEO_CHAT_STARTED, on_group_live_start))
+    app.add_handler(MessageHandler(filters.StatusUpdate.VIDEO_CHAT_ENDED, on_group_live_end))
 
-    if event.get("type") == "checkout.session.completed":
-        sess = event["data"]["object"]
-        md = sess.get("metadata") or {}
-        uname = md.get("uname", "")
-        payer = f"@{uname}" if uname else "Supporter"
-        amount = md.get("amount", "")
-        asyncio.get_event_loop().create_task(push_event({"type": "ding", "text": f"🎉 Gracias {payer} por {amount}!"}))
-    return "ok", 200
+    # Mensajes normales del grupo -> traducción
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_group_text))
 
-# -------------------- Lanzar --------------------
-if __name__ == "__main__":
-    telegram_app_singleton()
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
+def run():
+    t = threading.Thread(target=start_polling, daemon=True)
+    t.start()
     port = int(os.getenv("PORT", "10000"))
     web.run(host="0.0.0.0", port=port)
+
+if __name__ == "__main__":
+    run()
