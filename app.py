@@ -2,6 +2,7 @@ import os, json, threading, time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import telegram  # ✅ Corrección para evitar NameError
 from flask import Flask, jsonify, request
 from telegram import (
     Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -9,7 +10,7 @@ from telegram import (
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    filters, ContextTypes
+    filters, ContextTypes, CallbackQueryHandler
 )
 
 # =======================
@@ -120,7 +121,6 @@ async def cmd_liveon(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prices = load_prices()
     kb = build_menu_buttons(prices)
     if not CHANNEL_ID:
-        # si no hay canal configurado, publica donde se invoca
         await update.message.reply_text("📣 LIVE activado.", reply_markup=kb)
         return
     try:
@@ -139,9 +139,7 @@ async def noop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.answer("Usa los botones cuando haya enlace activo.")
 
-# (Mensaje -> eco simple; mantengo mínimo para no tocar tu lógica existente)
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Respuesta breve para comprobar que el bot está vivo
     if update.message and update.message.text:
         txt = update.message.text.strip().lower()
         if txt in ("hola", "hello"):
@@ -159,13 +157,9 @@ application.add_handler(CommandHandler("resetprices", cmd_resetprices))
 application.add_handler(CommandHandler("liveon", cmd_liveon))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 application.add_handler(MessageHandler(filters.StatusUpdate.ALL, on_text))
-application.add_handler(
-    # callbacks “noop” cuando no hay PUBLIC_BASE
-    telegram.ext.CallbackQueryHandler(noop_cb, pattern=r"^noop:")
-)
+application.add_handler(CallbackQueryHandler(noop_cb, pattern=r"^noop:"))  # ✅ Corregido
 
 def start_bot_in_thread():
-    # Importante: stop_signals=None para poder correr en hilo NO principal
     print("🤖 Bot iniciando en Render...")
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
@@ -184,7 +178,6 @@ def health():
 
 @app.get("/donar")
 def donate_redirect():
-    # Ruta de ejemplo; aquí normalmente generarías el Checkout de Stripe
     amt = request.args.get("amt", "0")
     item = request.args.get("item", "")
     return f"OK, simulación de donación recibida. Monto: {amt} EUR | Item: {item}"
@@ -193,9 +186,7 @@ def donate_redirect():
 # MAIN
 # =======================
 if __name__ == "__main__":
-    # Lanzar bot en segundo plano y dejar Flask bloqueando el proceso
     t = threading.Thread(target=start_bot_in_thread, name="start_polling", daemon=True)
     t.start()
     print("✅ Iniciando servidor Flask y bot...")
-    # clave para que Render NO termine el proceso
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
