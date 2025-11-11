@@ -1,147 +1,201 @@
-# prices_ext.py
-from __future__ import annotations
-import os
-import json
+import os, json, threading, time
 from pathlib import Path
-from typing import Dict, Any, List
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from typing import Dict, List, Tuple
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data"))
+from flask import Flask, jsonify, request
+from telegram import (
+    Update, InlineKeyboardMarkup, InlineKeyboardButton
+)
+from telegram.constants import ParseMode
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    filters, ContextTypes
+)
+
+# =======================
+# ENV & CONSTANTES
+# =======================
+BOT_TOKEN        = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+CHANNEL_ID       = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHANNEL_ID")
+ADMIN_USER_ID    = int(os.getenv("ADMIN_USER_ID", "0"))
+TRANSLATE_TO     = os.getenv("TRANSLATE_TO", "de")
+DATA_DIR         = Path(os.getenv("DATA_DIR", "/var/data"))
+PUBLIC_BASE      = os.getenv("PUBLIC_BASE") or os.getenv("BASE_URL") or ""
+PORT             = int(os.getenv("PORT", "10000"))
+
+assert BOT_TOKEN, "Falta TELEGRAM_BOT_TOKEN"
+
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-DATA_FILE = DATA_DIR / "data.json"
-CURRENCY = os.getenv("CURRENCY", "EUR")
+PRICES_PATH = DATA_DIR / "prices.json"
 
-def _load() -> Dict[str, Any]:
-    if not DATA_FILE.exists():
-        return {"prices": []}
+# =======================
+# UTIL PRECIOS
+# =======================
+def load_prices() -> List[Dict]:
+    if PRICES_PATH.exists():
+        try:
+            return json.loads(PRICES_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+def save_prices(prices: List[Dict]) -> None:
+    PRICES_PATH.write_text(json.dumps(prices, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def parse_price_args(args: List[str]) -> Tuple[str, float]:
+    # "Titten 20" -> ("Titten", 20.0)
+    if not args or len(args) < 2:
+        raise ValueError("Usa: /addprice Nombre 12.5")
+    *name_parts, last = args
+    name = " ".join(name_parts).strip()
+    price = float(last.replace("€", "").replace(",", "."))
+    return name, price
+
+def build_menu_buttons(prices: List[Dict]) -> InlineKeyboardMarkup:
+    rows = []
+    base = PUBLIC_BASE.rstrip("/")
+    for p in prices[:12]:  # hasta 12 botones
+        label = f"{p['name']} · {p['price']} EUR"
+        if base:
+            url = f"{base}/donar?amt={p['price']}&item={p['name']}"
+            rows.append([InlineKeyboardButton(text=label, url=url)])
+        else:
+            # si no hay PUBLIC_BASE, solo mostramos texto (sin URL)
+            rows.append([InlineKeyboardButton(text=label, callback_data=f"noop:{p['name']}")])
+    # Donación libre
+    if base:
+        rows.append([InlineKeyboardButton(text="💝 Donar libre", url=f"{base}/donar?amt=0")])
+    else:
+        rows.append([InlineKeyboardButton(text="💝 Donar libre", callback_data="noop:free")])
+    return InlineKeyboardMarkup(rows)
+
+# =======================
+# HANDLERS
+# =======================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Hola, soy CosplayLive Bot. Usa /whoami, /addprice, /listprices, /liveon.")
+
+async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid == ADMIN_USER_ID:
+        await update.message.reply_text(f"✅ Eres admin (ID: {uid})")
+    else:
+        await update.message.reply_text(f"🚫 No eres admin (tu ID: {uid})")
+
+async def cmd_addprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("Solo admin.")
+        return
     try:
-        return json.loads(DATA_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {"prices": []}
-
-def _save(db: Dict[str, Any]) -> None:
-    DATA_FILE.write_text(json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
-
-def _admin_ids() -> List[int]:
-    raw = os.getenv("ADMIN_USER_IDS") or os.getenv("ADMIN_USER_ID") or ""
-    ids = []
-    for token in raw.replace(";", ",").replace(" ", ",").split(","):
-        token = token.strip()
-        if not token:
-            continue
-        try:
-            ids.append(int(token))
-        except ValueError:
-            pass
-    return ids
-
-def _is_admin(user_id: int) -> bool:
-    return user_id in _admin_ids()
-
-def _parse_addprice(text: str) -> tuple[str, str] | None:
-    parts = text.strip().split(" ", maxsplit=1)
-    if len(parts) < 2:
-        return None
-    rest = parts[1].strip()
-    name, price_part = None, None
-
-    if rest.startswith('"'):
-        try:
-            closing = rest.index('"', 1)
-            name = rest[1:closing].strip()
-            price_part = rest[closing+1:].strip()
-        except ValueError:
-            return None
-    else:
-        tokens = rest.split()
-        if len(tokens) < 2:
-            return None
-        name = " ".join(tokens[:-1])
-        price_part = tokens[-1]
-
-    if not name:
-        return None
-    p = price_part.replace("€", "").replace(",", ".").strip()
-    if p.replace(".", "", 1).isdigit():
-        price_str = f"{p} {CURRENCY}"
-    else:
-        num, suf = "", ""
-        for ch in p:
-            if ch.isdigit() or ch == ".":
-                num += ch
-            else:
-                suf += ch
-        suf = suf.strip().upper().replace("EUR", "EUR")
-        if not num:
-            return None
-        price_str = f"{num} {suf or CURRENCY}"
-    return name.strip(), price_str.strip()
-
-async def cmd_addprice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user or not _is_admin(user.id):
-        await update.message.reply_text("Solo admin.")
+        name, price = parse_price_args(context.args)
+    except Exception as e:
+        await update.message.reply_text(f"Usa: /addprice Nombre 12.5\nDetalle: {e}")
         return
-    parsed = _parse_addprice(update.message.text)
-    if not parsed:
-        await update.message.reply_text("Usa: /addprice Nombre 10  (o /addprice \"Nombre con espacios\" 10€)")
-        return
-    name, price_str = parsed
-    db = _load()
-    prices = db.get("prices", [])
-    for row in prices:
-        if row.get("name", "").lower() == name.lower():
-            row["name"] = name
-            row["price"] = price_str
-            break
-    else:
-        prices.append({"name": name, "price": price_str})
-    db["prices"] = prices
-    _save(db)
-    await update.message.reply_text("💰 Precio guardado.")
+    prices = load_prices()
+    prices.append({"name": name, "price": price})
+    save_prices(prices)
+    await update.message.reply_text("💰 Precio agregado correctamente.")
 
-async def cmd_delprice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user or not _is_admin(user.id):
-        await update.message.reply_text("Solo admin.")
-        return
-    args = update.message.text.split(" ", maxsplit=1)
-    if len(args) < 2:
-        await update.message.reply_text("Usa: /delprice Nombre")
-        return
-    target = args[1].strip().lower()
-    db = _load()
-    prices = db.get("prices", [])
-    new_prices = [r for r in prices if r.get("name", "").lower() != target]
-    if len(new_prices) == len(prices):
-        await update.message.reply_text("No encontré ese nombre.")
-        return
-    db["prices"] = new_prices
-    _save(db)
-    await update.message.reply_text("🗑️ Precio eliminado.")
-
-async def cmd_listprices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    db = _load()
-    prices = db.get("prices", [])
+async def cmd_listprices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    prices = load_prices()
     if not prices:
-        await update.message.reply_text("No hay precios configurados.")
+        await update.message.reply_text("Aún no hay precios.")
         return
-    lines = ["💵 *Lista de precios:*"]
-    for row in prices:
-        lines.append(f"• {row.get('name')} — {row.get('price')}")
-    await update.message.reply_markdown_v2("\n".join(lines))
+    text = "💶 *Lista de precios:*\n" + "\n".join(
+        [f"• {p['name']} — {p['price']} EUR" for p in prices]
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
-async def cmd_resetprices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if not user or not _is_admin(user.id):
+async def cmd_resetprices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_USER_ID:
         await update.message.reply_text("Solo admin.")
         return
-    _save({"prices": []})
-    await update.message.reply_text("♻️ Precios reiniciados.")
+    save_prices([])
+    await update.message.reply_text("🧹 Precios borrados.")
 
-def register_price_handlers(app: Application) -> None:
-    app.add_handler(CommandHandler("addprice", cmd_addprice))
-    app.add_handler(CommandHandler("delprice", cmd_delprice))
-    app.add_handler(CommandHandler("listprices", cmd_listprices))
-    app.add_handler(CommandHandler("resetprices", cmd_resetprices))
+async def cmd_liveon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("Solo admin.")
+        return
+    prices = load_prices()
+    kb = build_menu_buttons(prices)
+    if not CHANNEL_ID:
+        # si no hay canal configurado, publica donde se invoca
+        await update.message.reply_text("📣 LIVE activado.", reply_markup=kb)
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=CHANNEL_ID,
+            text="📣 *Cosplay Emma LIVE* — Apoya y aparece en pantalla.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb
+        )
+        await update.message.reply_text("🟢 LIVE activado (mensaje enviado al canal).")
+    except Exception as e:
+        await update.message.reply_text(f"No pude publicar en el canal: {e}")
+
+async def noop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Para evitar error si no hay URL (callback “noop”)
+    if update.callback_query:
+        await update.callback_query.answer("Usa los botones cuando haya enlace activo.")
+
+# (Mensaje -> eco simple; mantengo mínimo para no tocar tu lógica existente)
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Respuesta breve para comprobar que el bot está vivo
+    if update.message and update.message.text:
+        txt = update.message.text.strip().lower()
+        if txt in ("hola", "hello"):
+            await update.message.reply_text("👋 Hola")
+
+# =======================
+# BOOT BOT (HILO)
+# =======================
+application = ApplicationBuilder().token(BOT_TOKEN).build()
+application.add_handler(CommandHandler("start", cmd_start))
+application.add_handler(CommandHandler("whoami", cmd_whoami))
+application.add_handler(CommandHandler("addprice", cmd_addprice))
+application.add_handler(CommandHandler("listprices", cmd_listprices))
+application.add_handler(CommandHandler("resetprices", cmd_resetprices))
+application.add_handler(CommandHandler("liveon", cmd_liveon))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+application.add_handler(MessageHandler(filters.StatusUpdate.ALL, on_text))
+application.add_handler(
+    # callbacks “noop” cuando no hay PUBLIC_BASE
+    telegram.ext.CallbackQueryHandler(noop_cb, pattern=r"^noop:")
+)
+
+def start_bot_in_thread():
+    # Importante: stop_signals=None para poder correr en hilo NO principal
+    print("🤖 Bot iniciando en Render...")
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        stop_signals=None
+    )
+
+# =======================
+# FLASK
+# =======================
+app = Flask(__name__)
+
+@app.get("/")
+def health():
+    return jsonify(ok=True, live=True)
+
+@app.get("/donar")
+def donate_redirect():
+    # Ruta de ejemplo; aquí normalmente generarías el Checkout de Stripe
+    amt = request.args.get("amt", "0")
+    item = request.args.get("item", "")
+    return f"OK, simulación de donación recibida. Monto: {amt} EUR | Item: {item}"
+
+# =======================
+# MAIN
+# =======================
+if __name__ == "__main__":
+    # Lanzar bot en segundo plano y dejar Flask bloqueando el proceso
+    t = threading.Thread(target=start_bot_in_thread, name="start_polling", daemon=True)
+    t.start()
+    print("✅ Iniciando servidor Flask y bot...")
+    # clave para que Render NO termine el proceso
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
