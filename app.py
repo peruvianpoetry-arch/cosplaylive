@@ -1,8 +1,8 @@
-import os, json, threading, time
+import os, json, threading, asyncio
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-import telegram  # ✅ Corrección para evitar NameError
+import telegram  # para CallbackQueryHandler
 from flask import Flask, jsonify, request
 from telegram import (
     Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -44,7 +44,6 @@ def save_prices(prices: List[Dict]) -> None:
     PRICES_PATH.write_text(json.dumps(prices, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def parse_price_args(args: List[str]) -> Tuple[str, float]:
-    # "Titten 20" -> ("Titten", 20.0)
     if not args or len(args) < 2:
         raise ValueError("Usa: /addprice Nombre 12.5")
     *name_parts, last = args
@@ -55,15 +54,13 @@ def parse_price_args(args: List[str]) -> Tuple[str, float]:
 def build_menu_buttons(prices: List[Dict]) -> InlineKeyboardMarkup:
     rows = []
     base = PUBLIC_BASE.rstrip("/")
-    for p in prices[:12]:  # hasta 12 botones
+    for p in prices[:12]:
         label = f"{p['name']} · {p['price']} EUR"
         if base:
             url = f"{base}/donar?amt={p['price']}&item={p['name']}"
             rows.append([InlineKeyboardButton(text=label, url=url)])
         else:
-            # si no hay PUBLIC_BASE, solo mostramos texto (sin URL)
             rows.append([InlineKeyboardButton(text=label, callback_data=f"noop:{p['name']}")])
-    # Donación libre
     if base:
         rows.append([InlineKeyboardButton(text="💝 Donar libre", url=f"{base}/donar?amt=0")])
     else:
@@ -135,7 +132,6 @@ async def cmd_liveon(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"No pude publicar en el canal: {e}")
 
 async def noop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Para evitar error si no hay URL (callback “noop”)
     if update.callback_query:
         await update.callback_query.answer("Usa los botones cuando haya enlace activo.")
 
@@ -157,15 +153,16 @@ application.add_handler(CommandHandler("resetprices", cmd_resetprices))
 application.add_handler(CommandHandler("liveon", cmd_liveon))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 application.add_handler(MessageHandler(filters.StatusUpdate.ALL, on_text))
-application.add_handler(CallbackQueryHandler(noop_cb, pattern=r"^noop:"))  # ✅ Corregido
+application.add_handler(CallbackQueryHandler(noop_cb, pattern=r"^noop:"))
 
 def start_bot_in_thread():
     print("🤖 Bot iniciando en Render...")
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-        stop_signals=None
-    )
+    loop = asyncio.new_event_loop()          # ✅ crea loop nuevo
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(application.initialize())
+    loop.create_task(application.start())
+    loop.create_task(application.updater.start_polling())
+    loop.run_forever()
 
 # =======================
 # FLASK
