@@ -1,248 +1,280 @@
-import os, json, threading, logging
-from urllib.parse import quote
+import os
+import logging
+import threading
+from urllib.parse import quote_plus
 from time import monotonic
 
-from flask import Flask, request, jsonify
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from flask import Flask, request, jsonify, make_response
+from deep_translator import GoogleTranslator
+
+import stripe
+
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup
+)
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes,
-    filters,
+    filters
 )
 
-# -------------------- Config --------------------
+# -------------------- CONFIG --------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s :: %(message)s"
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
 log = logging.getLogger("cosplaylive")
 
-BOT_TOKEN        = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
-ADMIN_IDS_ENV    = os.environ.get("ADMIN_USER_IDS", "")  # coma-sep
-PUBLIC_BASE      = (os.environ.get("PUBLIC_BASE") or os.environ.get("BASE_URL") or "").rstrip("/")
-CURRENCY         = os.environ.get("CURRENCY", "EUR")
-TRANSLATE_TO     = os.environ.get("TRANSLATE_TO", "").strip().lower()
-AUTO_MIN         = int(os.environ.get("AUTO_INTERVAL_MIN", "10"))
-DATA_DIR         = os.environ.get("DATA_DIR", "/var/data")
-STRIPE_KEY       = os.environ.get("STRIPE_SECRET_KEY", "").strip()
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+PUBLIC_BASE = os.getenv("PUBLIC_BASE", os.getenv("BASE_URL", "")).rstrip("/")
+CURRENCY = os.getenv("CURRENCY", "EUR")
+AUTO_MIN = int(os.getenv("AUTO_INTERVAL_MIN", "10"))
+ALLOW_ADULT = os.getenv("ALLOW_ADULT", "1") == "1"
 
-os.makedirs(DATA_DIR, exist_ok=True)
-DATA_FILE = os.path.join(DATA_DIR, "data.json")
+# Admins: "123,456"
+_admin_raw = os.getenv("ADMIN_USER_IDS") or os.getenv("ADMIN_USER_ID", "")
+ADMIN_IDS = {int(x) for x in [s.strip() for s in _admin_raw.split(",")] if x.strip().isdigit()}
 
-def _load():
-    if not os.path.exists(DATA_FILE):
-        return {"prices": {}, "live_chats": {}, "created": monotonic()}
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+# Traducción
+ENABLE_TRANSLATION = (os.getenv("ENABLE_TRANSLATION", "True")).lower() == "true"
+TRANSLATE_TO = os.getenv("TRANSLATE_TO", "de")
 
-def _save(d):
-    tmp = DATA_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, DATA_FILE)
+# Stripe
+STRIPE_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
+if STRIPE_KEY:
+    stripe.api_key = STRIPE_KEY
 
-DATA = _load()
+# Canal/sala (opcional)
+CHANNEL_ID = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHANNEL_ID")
 
-def is_admin(user_id:int) -> bool:
-    if not ADMIN_IDS_ENV:
-        return True  # si no hay lista, no bloqueamos
-    allowed = {int(x.strip()) for x in ADMIN_IDS_ENV.split(",") if x.strip().isdigit()}
-    return user_id in allowed
+# Estado en memoria (persistente suficiente para Render Starter)
+DATA = {
+    "prices": {},       # {"Nombre visible": 10}
+    "live_chat_id": None,
+    "auto_job": None,
+    "last_announce": 0.0
+}
 
-# -------------------- Flask (pagos) --------------------
+# -------------------- FLASK --------------------
 app = Flask(__name__)
 
 @app.get("/")
-def root():
-    return "OK cosplaylive"
+def health():
+    return "OK", 200
 
-def _stripe_checkout(amount_cents:int, name:str):
-    if not STRIPE_KEY:
-        # Simulación
-        return {"mode": "sim", "ok": True, "amount": amount_cents, "name": name}
-    import stripe
-    stripe.api_key = STRIPE_KEY
-    session = stripe.checkout.Session.create(
-        mode="payment",
-        line_items=[{
-            "price_data": {
-                "currency": CURRENCY.lower(),
-                "product_data": {"name": name[:60]},
-                "unit_amount": amount_cents,
-            },
-            "quantity": 1,
-        }],
-        success_url=f"{PUBLIC_BASE}/pay/success",
-        cancel_url=f"{PUBLIC_BASE}/pay/cancel",
-    )
-    return {"mode": "stripe", "id": session.id, "url": session.url}
-
-@app.get("/pay")
-def pay():
-    # /pay?amt=500&name=Titten
+@app.get("/donar")
+def donar():
+    """
+    Recibe amt (euros) e item (nombre visible). Crea checkout de Stripe si hay clave,
+    si no, devuelve simulación OK.
+    """
     try:
-        amount = int(request.args.get("amt", "0"))
-        name = request.args.get("name", "Support")
-        res = _stripe_checkout(amount, name)
-        if res["mode"] == "sim":
-            return f"OK, simulación de pago: {amount/100:.2f} {CURRENCY} | Item: {name}"
-        return f'<a href="{res["url"]}">Ir a Stripe</a>', 200
+        amt = request.args.get("amt", "").strip()
+        item = request.args.get("item", "").strip()
+        if not amt or not item:
+            return make_response("Parámetros inválidos", 400)
+
+        amount_cents = int(float(amt) * 100)
+
+        # Con Stripe real
+        if STRIPE_KEY:
+            session = stripe.checkout.Session.create(
+                mode="payment",
+                payment_method_types=["card"],
+                line_items=[{
+                    "price_data": {
+                        "currency": CURRENCY.lower(),
+                        "product_data": {"name": item[:120]},
+                        "unit_amount": amount_cents
+                    },
+                    "quantity": 1
+                }],
+                success_url=f"{PUBLIC_BASE}/ok",
+                cancel_url=f"{PUBLIC_BASE}/cancel"
+            )
+            # Redirigir al Checkout
+            return jsonify({"checkout_url": session.url})
+
+        # Modo demo (sin Stripe)
+        return f"OK, simulación de donación recibida. Monto: {amt} {CURRENCY} | Item: {item}"
+
     except Exception as e:
-        log.exception("Error en /pay")
-        return f"Error: {e}", 500
+        log.exception("Error en /donar")
+        return make_response(f"Error: {e}", 500)
 
-# -------------------- Bot --------------------
-application: Application = Application.builder().token(BOT_TOKEN).build()
+@app.get("/ok")
+def ok():
+    return "Pago completado (demo).", 200
 
-def _menu_keyboard() -> InlineKeyboardMarkup:
-    buttons = []
-    # Orden estable por nombre
-    for name, price in sorted(DATA["prices"].items()):
-        # botones legibles para Telegram; URL sanitizada
-        amt_cents = int(round(float(price) * 100))
-        safe_name = quote(name, safe="")
-        url = f"{PUBLIC_BASE}/pay?amt={amt_cents}&name={safe_name}"
-        label = f"{name} · {float(price):.2f} {CURRENCY}"
-        buttons.append([InlineKeyboardButton(text=label, url=url)])
-    return InlineKeyboardMarkup(buttons) if buttons else InlineKeyboardMarkup([])
+@app.get("/cancel")
+def cancel():
+    return "Pago cancelado.", 200
 
-def _prices_text() -> str:
+def run_flask():
+    port = int(os.getenv("PORT", "10000"))
+    # Flask en hilo secundario
+    app.run(host="0.0.0.0", port=port, threaded=True)
+
+# -------------------- TELEGRAM --------------------
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+def fmt_menu() -> str:
     if not DATA["prices"]:
-        return "Aún no hay precios. Usa /addprice Nombre, 10"
-    lines = [f"• {n} — {float(p):.2f} {CURRENCY}" for n, p in sorted(DATA["prices"].items())]
-    return "🎬 Menú del show\n" + "\n".join(lines) + "\n\nPulsa un botón para apoyar al show 🔥"
+        return "Aún no hay opciones. Usa /addprice Nombre · Precio"
+    lines = [ "🎬 *Menú del show*"]
+    for n, p in DATA["prices"].items():
+        lines.append(f"• {n} — {p:.2f} {CURRENCY}")
+    lines.append("\nPulsa un botón para apoyar al show 🔥")
+    return "\n".join(lines)
+
+def build_keyboard():
+    if not PUBLIC_BASE:
+        return None
+    rows = []
+    for name, price in DATA["prices"].items():
+        qs = f"amt={price:.2f}&item={quote_plus(name)}"
+        url = f"{PUBLIC_BASE}/donar?{qs}"
+        rows.append([InlineKeyboardButton(f"{name} · {price:.2f} {CURRENCY}", url=url)])
+    return InlineKeyboardMarkup(rows) if rows else None
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = update.effective_message
-    uid = update.effective_user.id if update.effective_user else 0
-    if not m:
-        return
-    await m.reply_text("Hola 👋\nUsa /addprice Nombre, 5 para añadir opciones.\n/liveon o /liveoff para controlar el menú.")
-    if is_admin(uid):
-        await m.reply_text(f"✅ Eres admin (ID: {uid})")
+    await update.effective_chat.send_message(
+        "Hola 👋\nUsa /addprice Nombre · Precio para añadir opciones.\n/livezona o /liveon para mostrar el menú.",
+    )
 
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = update.effective_message
-    if not m: return
     uid = update.effective_user.id if update.effective_user else 0
-    await m.reply_text(f"{'✅' if is_admin(uid) else '❌'} Eres admin (ID: {uid})")
+    if is_admin(uid):
+        await update.effective_chat.send_message(f"✅ Eres admin (ID: {uid})")
+    else:
+        await update.effective_chat.send_message("Solo admin.")
 
 async def cmd_addprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = update.effective_message
-    if not m: return
     uid = update.effective_user.id if update.effective_user else 0
     if not is_admin(uid):
-        await m.reply_text("Solo admin.")
-        return
-    # Formato: /addprice Nombre, 10
-    raw = (m.text or "").split(" ", 1)
-    if len(raw) < 2 or "," not in raw[1]:
-        await m.reply_text("Formato incorrecto. Usa: /addprice 🍑 Nombre, 5€")
-        return
-    name_part, price_part = [x.strip() for x in raw[1].split(",", 1)]
+        return await update.effective_chat.send_message("Solo admin.")
+
+    txt = (update.message.text or "").strip()
+    # formato: /addprice Nombre, 10   ó   /addprice Nombre · 10
+    raw = txt.split(" ", 1)
+    if len(raw) < 2:
+        return await update.effective_chat.send_message("Formato incorrecto. Usa: /addprice 🍑 Nombre 5€")
+
+    payload = raw[1]
+    if "·" in payload:
+        name, price_s = [s.strip() for s in payload.split("·", 1)]
+    elif "," in payload:
+        name, price_s = [s.strip() for s in payload.split(",", 1)]
+    else:
+        parts = payload.rsplit(" ", 1)
+        if len(parts) != 2:
+            return await update.effective_chat.send_message("Formato incorrecto. Usa: /addprice Nombre 5")
+        name, price_s = parts[0].strip(), parts[1].strip()
+
+    price_s = price_s.replace("€", "").replace(",", ".")
     try:
-        price = float(price_part.replace("€", "").replace(",", ".").strip())
-    except Exception:
-        await m.reply_text("Precio inválido. Ej: /addprice Titten, 5")
-        return
-    DATA["prices"][name_part] = price
-    _save(DATA)
-    await m.reply_text("💰 Precio agregado correctamente.")
+        price = float(price_s)
+    except:
+        return await update.effective_chat.send_message("Precio inválido.")
+
+    DATA["prices"][name] = price
+    await update.effective_chat.send_message("💰 Precio agregado correctamente.")
 
 async def cmd_listprices(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = update.effective_message
-    if not m: return
-    await m.reply_text(_prices_text(), reply_markup=_menu_keyboard())
+    await update.effective_chat.send_message(fmt_menu(), reply_markup=build_keyboard(), parse_mode="Markdown")
 
-# ---- Anuncios automáticos ----
-def _job_name(chat_id:int) -> str:
-    return f"auto_ads_{chat_id}"
+async def auto_banner(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = DATA["live_chat_id"]
+    if not chat_id:
+        return
+    # Throttle anti-spam
+    now = monotonic()
+    if now - DATA["last_announce"] < (AUTO_MIN * 60 * 0.8):
+        return
+    DATA["last_announce"] = now
 
-async def _auto_ad(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = context.job.chat_id if context.job else None
-    if not chat_id: return
     try:
-        await context.bot.send_message(chat_id, "✨ ¡Disfruta el show! Si te gusta, apóyalo con un botón del menú. ✨",
-                                       reply_markup=_menu_keyboard())
-    except Exception as e:
-        log.warning("Auto ad error: %s", e)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=fmt_menu(),
+            reply_markup=build_keyboard(),
+            parse_mode="Markdown"
+        )
+    except Exception:
+        log.exception("Error enviando banner automático")
 
 async def cmd_liveon(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = update.effective_message
-    chat = update.effective_chat
     uid = update.effective_user.id if update.effective_user else 0
-    if not (m and chat): return
     if not is_admin(uid):
-        await m.reply_text("Solo admin.")
-        return
-    DATA["live_chats"][str(chat.id)] = True
-    _save(DATA)
-    await m.reply_text(_prices_text(), reply_markup=_menu_keyboard())
+        return await update.effective_chat.send_message("Solo admin.")
+    DATA["live_chat_id"] = update.effective_chat.id
 
-    # programa anuncios
-    name = _job_name(chat.id)
-    # Cancela si existe
-    for j in context.job_queue.get_jobs_by_name(name):
-        j.schedule_removal()
-    context.job_queue.run_repeating(
-        _auto_ad, interval=AUTO_MIN * 60, first=AUTO_MIN * 60,
-        chat_id=chat.id, name=name
-    )
-    log.info("Live ON en %s; anuncios cada %s min", chat.id, AUTO_MIN)
+    # Enviar el menú una vez
+    await update.effective_chat.send_message(fmt_menu(), reply_markup=build_keyboard(), parse_mode="Markdown")
+
+    # Programar anuncios automáticos
+    if context.job_queue:
+        # Cancelar previo
+        if DATA["auto_job"]:
+            DATA["auto_job"].schedule_removal()
+        DATA["auto_job"] = context.job_queue.run_repeating(
+            auto_banner, interval=AUTO_MIN * 60, first=AUTO_MIN * 60, name=f"auto_ads_{update.effective_chat.id}"
+        )
+
+    await update.effective_chat.send_message("🔔 Auto-anuncios activados.")
 
 async def cmd_liveoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = update.effective_message
-    chat = update.effective_chat
     uid = update.effective_user.id if update.effective_user else 0
-    if not (m and chat): return
     if not is_admin(uid):
-        await m.reply_text("Solo admin.")
-        return
-    DATA["live_chats"][str(chat.id)] = False
-    _save(DATA)
-    name = _job_name(chat.id)
-    for j in context.job_queue.get_jobs_by_name(name):
-        j.schedule_removal()
-    await m.reply_text("🛑 Live OFF. Anuncios detenidos.")
-
-# ---- Traducción ligera ----
-try:
-    from deep_translator import GoogleTranslator
-except Exception:
-    GoogleTranslator = None
+        return await update.effective_chat.send_message("Solo admin.")
+    if DATA["auto_job"]:
+        DATA["auto_job"].schedule_removal()
+        DATA["auto_job"] = None
+    await update.effective_chat.send_message("🔕 Auto-anuncios desactivados.")
 
 async def translate_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    if not msg or not msg.text:
+    # Ignorar eventos sin texto (p.ej., posts de canal)
+    if not update.message or not update.message.text:
         return
-    if not TRANSLATE_TO or not GoogleTranslator:
+    if not ENABLE_TRANSLATION:
         return
-    # Evita bucles: no traduzcas mensajes del propio bot
-    if update.effective_user and update.effective_user.is_bot:
+    # Evitar traducir comandos
+    if update.message.text.startswith("/"):
         return
     try:
-        tr = GoogleTranslator(source="auto", target=TRANSLATE_TO).translate(msg.text)
-        if tr and tr.strip().lower() != msg.text.strip().lower():
-            await msg.reply_text(f"🌍 {tr}")
-    except Exception as e:
-        log.debug("Translate error: %s", e)
+        txt = update.message.text.strip()
+        translated = GoogleTranslator(source="auto", target=TRANSLATE_TO).translate(txt)
+        if translated and translated != txt:
+            await update.message.reply_text(f"🌐 {translated}")
+    except Exception:
+        # No reventar el bot si falla el traductor
+        log.warning("Fallo traducción", exc_info=True)
 
-# Handlers
-application.add_handler(CommandHandler("start",   cmd_start))
-application.add_handler(CommandHandler("whoami",  cmd_whoami))
-application.add_handler(CommandHandler("addprice", cmd_addprice))
-application.add_handler(CommandHandler("listprices", cmd_listprices))
-application.add_handler(CommandHandler("liveon",  cmd_liveon))
-application.add_handler(CommandHandler("liveoff", cmd_liveoff))
-application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), translate_in_chat))
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Handler error: %s", context.error)
 
-# -------------------- Run (Flask + Bot) --------------------
-def _run_bot():
-    # run_polling() es bloqueante; lo lanzamos en hilo aparte
-    application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+def build_app() -> Application:
+    app_tg = Application.builder().token(TOKEN).build()
 
+    app_tg.add_handler(CommandHandler("start", cmd_start))
+    app_tg.add_handler(CommandHandler("whoami", cmd_whoami))
+    app_tg.add_handler(CommandHandler("addprice", cmd_addprice))
+    app_tg.add_handler(CommandHandler("listprices", cmd_listprices))
+    app_tg.add_handler(CommandHandler("liveon", cmd_liveon))
+    app_tg.add_handler(CommandHandler("liveoff", cmd_liveoff))
+
+    app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, translate_in_chat))
+
+    app_tg.add_error_handler(on_error)
+    return app_tg
+
+# -------------------- MAIN --------------------
 if __name__ == "__main__":
     log.info("Bot iniciando en Render…  ✅ Iniciando servidor Flask y bot…")
-    t = threading.Thread(target=_run_bot, name="tg-bot", daemon=True)
-    t.start()
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+
+    # 1) Lanzar Flask en hilo secundario
+    threading.Thread(target=run_flask, daemon=True).start()
+
+    # 2) Bot en HILO PRINCIPAL (requisito PTB 20.x para JobQueue)
+    application = build_app()
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
