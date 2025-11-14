@@ -1,53 +1,88 @@
-# --- reemplaza la función de anuncio actual por esta ---
-async def announce_job(context: ContextTypes.DEFAULT_TYPE):
+# ============================================================
+#  BLOQUE DE ANUNCIOS AUTOMÁTICOS (LIVEON / LIVEOFF)
+# ============================================================
+from telegram.ext import ContextTypes  # por si no estaba importado
+
+# Mensaje que el bot enviará cada X minutos cuando el show está en vivo
+AUTO_AD_TEXT = "🔥 Unterstütze die Show mit einem Klick!\nDas Model bedankt sich live."
+
+async def announce_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Job que envía el anuncio automático al chat del show.
+    Se usa el chat_id que está guardado en el propio job.
+    """
     chat_id = context.job.chat_id
     try:
-        await context.bot.send_message(chat_id=chat_id,
-                                       text=ANNOUNCE_TEXT_DE)
-        # Log visible en Render
-        print(f"[ANNOUNCE] Sent to {chat_id}")
+        await context.bot.send_message(chat_id=chat_id, text=AUTO_AD_TEXT)
     except Exception as e:
-        print(f"[ANNOUNCE][ERR] {e}")
+        print(f"[announce_job] Error enviando anuncio: {e}")
 
-# --- reemplaza liveon por esta versión robusta ---
-async def liveon(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    if not chat_id:
+
+async def cmd_liveon(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Activa anuncios automáticos en ESTE chat.
+    No hace falta /bindhere, solo escribir /liveon en la sala de chat de la modelo.
+    """
+    if not update.effective_chat:
         return
 
-    target = _state["chat_id"] or chat_id   # usa chat fijado si existe
-    set_live(target, True)
+    chat_id = update.effective_chat.id
+    job_name = f"auto_ads_{chat_id}"
 
-    kb = InlineKeyboardMarkup(price_rows())
-    await context.bot.send_message(chat_id=target, text=WELCOME_TEXT_DE)
-    await context.bot.send_message(
-        chat_id=target, text=prices_menu_text_de(),
-        parse_mode="Markdown", reply_markup=kb
-    )
+    # Cancelar jobs antiguos de este mismo chat (por si se llama dos veces)
+    try:
+        existing = context.job_queue.get_jobs_by_name(job_name)
+    except Exception as e:
+        print(f"[cmd_liveon] Error obteniendo jobs: {e}")
+        existing = []
 
-    # Limpia jobs anteriores con el mismo nombre
-    for job in context.job_queue.get_jobs_by_name(f"auto_ads_{target}"):
+    for job in existing:
         job.schedule_removal()
 
-    # Programa anuncios usando chat_id del Job (más fiable)
-    context.job_queue.run_repeating(
-        announce_job,
-        interval=ANNOUNCE_EVERY_MIN * 60,
-        first=ANNOUNCE_EVERY_MIN * 60,
-        chat_id=target,
-        name=f"auto_ads_{target}",
-    )
-
-    if update.message and (chat_id != target):
-        await update.message.reply_text("🟢 Live activado en la sala fijada.")
-
-# --- reemplaza liveoff por esta ---
-async def liveoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = _state["chat_id"] or (update.effective_chat.id if update.effective_chat else None)
-    if not chat_id:
+    # Crear nuevo job que manda el anuncio cada 5 minutos
+    try:
+        context.job_queue.run_repeating(
+            announce_job,
+            interval=300,      # 300 segundos = 5 minutos
+            first=0,           # primer anuncio inmediatamente
+            chat_id=chat_id,
+            name=job_name,
+        )
+    except Exception as e:
+        print(f"[cmd_liveon] Error creando job: {e}")
+        await update.message.reply_text("⚠️ No pude activar los anuncios automáticos.")
         return
-    set_live(chat_id, False)
-    for job in context.job_queue.get_jobs_by_name(f"auto_ads_{chat_id}"):
+
+    await update.message.reply_text(
+        "✅ Ankündigungen aktiviert.\n"
+        "Der Bot postet jetzt alle 5 Minuten eine Nachricht in diesem Chat."
+    )
+
+
+async def cmd_liveoff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Desactiva anuncios automáticos en ESTE chat.
+    """
+    if not update.effective_chat:
+        return
+
+    chat_id = update.effective_chat.id
+    job_name = f"auto_ads_{chat_id}"
+
+    try:
+        jobs = context.job_queue.get_jobs_by_name(job_name)
+    except Exception as e:
+        print(f"[cmd_liveoff] Error obteniendo jobs: {e}")
+        jobs = []
+
+    if not jobs:
+        await update.message.reply_text("ℹ️ Es sind keine automatischen Ankündigungen aktiv.")
+        return
+
+    for job in jobs:
         job.schedule_removal()
-    if update.message:
-        await update.message.reply_text("🔴 Live desactiviert.")
+
+    await update.message.reply_text("🛑 Ankündigungen wurden für diesen Chat deaktiviert.")
+# ============================================================
+#  FIN DEL BLOQUE DE ANUNCIOS AUTOMÁTICOS
+# ============================================================
