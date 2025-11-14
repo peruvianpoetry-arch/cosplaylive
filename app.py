@@ -358,21 +358,14 @@ def start_bot():
         logger.error("TELEGRAM_TOKEN no está configurado.")
         return
 
+    # *** IMPORTANTE: crear event loop en este hilo ***
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
     # Guardamos la instancia global para usarla en el webhook
     tg_app = application
-
-    # Handlers
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("menu", cmd_menu))
-    application.add_handler(CommandHandler("liveon", cmd_liveon))
-    application.add_handler(CommandHandler("liveoff", cmd_liveoff))
-
-    # Traducción: mensajes de texto en chats
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, translate_in_chat)
-    )
 
     logger.info("Bot de Telegram iniciando con run_polling()...")
     application.run_polling(drop_pending_updates=True)
