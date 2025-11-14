@@ -1,285 +1,310 @@
-import os, json, threading, logging, urllib.parse, math
-from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+import os
+import json
+import threading
+import time
+import asyncio
+from urllib.parse import urlencode, quote_plus
 
-from flask import Flask, redirect, request, abort
+from flask import Flask, request, redirect, make_response
 import stripe
 
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup
 )
-from deep_translator import GoogleTranslator
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    ContextTypes, filters
+)
 
-# ---------- Config ----------
-PORT               = int(os.getenv("PORT", "10000"))
-PUBLIC_BASE        = os.getenv("PUBLIC_BASE", "").rstrip("/")
-BASE_URL           = os.getenv("BASE_URL", PUBLIC_BASE).rstrip("/")
-DATA_DIR           = Path(os.getenv("DATA_DIR", "/var/data")); DATA_DIR.mkdir(parents=True, exist_ok=True)
-DATA_FILE          = DATA_DIR / "data.json"
+# ========= CONFIG =========
+TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+STRIPE_SK = os.getenv("STRIPE_SECRET_KEY", "").strip()
+BASE_URL = os.getenv("BASE_URL", "https://cosplaylive.onrender.com").rstrip("/")
+CURRENCY = os.getenv("CURRENCY", "EUR")
+ANNOUNCE_EVERY_MIN = int(os.getenv("ANNOUNCE_EVERY_MIN", "5"))
+ANNOUNCE_TEXT = os.getenv(
+    "ANNOUNCE_TEXT",
+    "🔥 ¡Apoya el show con un botón! La modelo te dará las gracias en vivo."
+)
 
-TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", TELEGRAM_TOKEN)
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")  # chat numérico del LIVE
-ADMIN_USER_ID      = os.getenv("ADMIN_USER_ID", "").strip()
-AUTO_INTERVAL_MIN  = int(os.getenv("AUTO_INTERVAL_MIN", "5"))
-TRANSLATE_TO       = os.getenv("TRANSLATE_TO", "de")
-CURRENCY           = os.getenv("CURRENCY", "EUR")
+# Chat/grupo donde anunciaremos (el chat donde usas /liveon)
+/* PON tu chat_id aquí si quieres forzarlo; si no, se usa dinámico por chat */
+DEFAULT_CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-stripe.api_key     = os.getenv("STRIPE_SECRET_KEY", "").strip()
+# Usuario (id) de la modelo para DM al pagar (opcional)
+MODEL_USER_ID = os.getenv("MODEL_USER_ID", "").strip()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
-log = logging.getLogger("cosplaylive")
+# Precios base (puedes cambiarlos aquí y olvidarte de /addprice)
+DEFAULT_PRICES = {
+    "Titten": 10.00,
+    "Muschi": 15.00,
+    "Dildo": 20.00,
+    "Masturbation": 35.00
+}
+# =========================
 
-# ---------- Estado persistente ----------
-def load_data() -> Dict[str, Any]:
-    if DATA_FILE.exists():
-        try:
-            d = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            d = {}
-    else:
-        d = {}
-    # Defaults
-    d.setdefault("live", False)
-    d.setdefault("welcome", "Hola 👋 ¡Bienvenidos al show!")
-    d.setdefault("prices", {})
-    # MIGRACIÓN: si algún precio es float/str → dict {'label','amount'}
-    migrated = False
-    new_prices = {}
-    for pid, val in d.get("prices", {}).items():
-        if isinstance(val, dict) and "amount" in val:
-            try:
-                amt = float(val["amount"])
-            except Exception:
-                continue
-            new_prices[pid] = {"label": val.get("label") or pid.replace("-", " ").title(), "amount": amt}
-        else:
-            # era float/str antiguo
-            try:
-                amt = float(val)
-                new_prices[pid] = {"label": pid.replace("-", " ").title(), "amount": amt}
-                migrated = True
-            except Exception:
-                # dato corrupto: lo ignoramos
-                migrated = True
-    if migrated:
-        d["prices"] = new_prices
-        try: DATA_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception: pass
-    return d
+app = Flask(__name__)
+stripe.api_key = STRIPE_SK
 
-def save_data(d: Dict[str, Any]):
-    DATA_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+# Estado en memoria
+live_chats = set()                 # chats con live activo
+prices = DEFAULT_PRICES.copy()     # dict nombre -> float
 
-data = load_data()
+# --- Utilidades ---
 
-# ---------- Utils ----------
-def is_admin(update: Update) -> bool:
-    return ADMIN_USER_ID and update.effective_user and str(update.effective_user.id) == ADMIN_USER_ID
+def price_rows():
+    # Devuelve lista de filas de botones (1 por fila)
+    rows = []
+    for name, amount in prices.items():
+        # Armamos URL de pay segura (sin emojis/espacios raros sin codificar)
+        pay_qs = urlencode({
+            "name": name,
+            "amount": f"{amount:.2f}"
+        }, quote_via=quote_plus)
+        pay_url = f"{BASE_URL}/pay?{pay_qs}"
+        rows.append([InlineKeyboardButton(f"{name} · {amount:.2f} {CURRENCY}", url=pay_url)])
+    return rows
 
-def safe_stripe_name(label: str) -> str:
-    return (label or "Apoyo").encode("ascii", "ignore").decode().strip() or "Apoyo"
-
-def norm_item(pid: str, item: Any) -> Optional[Tuple[str, float]]:
-    """Devuelve (label, amount) o None si inválido."""
-    if isinstance(item, dict):
-        label = item.get("label") or pid.replace("-", " ").title()
-        try:
-            amount = float(item.get("amount"))
-        except Exception:
-            return None
-        return label, amount
-    try:
-        amount = float(item)
-        return (pid.replace("-", " ").title(), amount)
-    except Exception:
-        return None
-
-def prices_menu_text() -> str:
-    if not data["prices"]:
-        return "Aún no hay opciones. Usa /addprice Nombre, Precio"
+def prices_menu_text():
     lines = ["🎬 *Menú del show*"]
-    for pid, raw in data["prices"].items():
-        norm = norm_item(pid, raw)
-        if not norm: continue
-        label, amount = norm
-        lines.append(f"• {label} — *{amount:.2f} {CURRENCY}*")
+    for name, amount in prices.items():
+        lines.append(f"• {name} — {amount:.2f} {CURRENCY}")
     lines.append("\nPulsa un botón para apoyar al show 🔥")
     return "\n".join(lines)
 
-def build_price_keyboard() -> InlineKeyboardMarkup:
-    rows = []
-    for pid, raw in data["prices"].items():
-        norm = norm_item(pid, raw)
-        if not norm: continue
-        label, amount = norm
-        url = f"{BASE_URL}/donar?id={urllib.parse.quote(pid)}"
-        rows.append([InlineKeyboardButton(text=f"{label} · {amount:.2f} {CURRENCY}", url=url)])
-    return InlineKeyboardMarkup(rows)
-
-def translator_safe(text: str, to: str) -> Optional[str]:
+async def send_announce(app_bot: Application, chat_id: int):
     try:
-        out = GoogleTranslator(source="auto", target=to).translate(text)
-        return out.strip() if isinstance(out, str) else None
-    except Exception as e:
-        log.warning("Translator error: %s", e); return None
-
-# ---------- Telegram ----------
-application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        await update.effective_chat.send_message("Usa /liveon para ver el menú (solo admin)."); return
-    await update.effective_chat.send_message(
-        "Hola 👋\n/addprice Nombre, Precio\n/listprices\n/liveon para mostrar el menú\n/liveoff para parar anuncios."
-    )
-
-async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_chat.send_message("✅ Eres admin (ID: %s)" % ADMIN_USER_ID if is_admin(update) else "No eres admin.")
-
-async def cmd_addprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return await update.effective_chat.send_message("Solo admin.")
-    parts = (update.message.text or "").split(" ", 1)
-    if len(parts) < 2 or "," not in parts[1]:
-        return await update.effective_chat.send_message("Formato incorrecto. Usa: /addprice 🍑 Nombre, 5")
-    name_part, price_part = [p.strip() for p in parts[1].split(",", 1)]
-    amount_str = "".join(ch for ch in price_part if (ch.isdigit() or ch in ".,"))
-    try:
-        amount = float(amount_str.replace(",", "."))
-    except Exception:
-        return await update.effective_chat.send_message("Precio inválido.")
-    if amount <= 0: return await update.effective_chat.send_message("Precio inválido.")
-    pid = name_part.lower().strip().replace(" ", "-")
-    data["prices"][pid] = {"label": name_part, "amount": amount}
-    save_data(data)
-    await update.effective_chat.send_message("💰 Precio agregado correctamente.")
-
-async def cmd_listprices(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return await update.effective_chat.send_message("Solo admin.")
-    await update.effective_chat.send_message(prices_menu_text(), parse_mode="Markdown")
-
-async def cmd_resetprices(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return await update.effective_chat.send_message("Solo admin.")
-    data["prices"] = {}; save_data(data)
-    await update.effective_chat.send_message("🧹 Precios borrados.")
-
-async def auto_ads(context: ContextTypes.DEFAULT_TYPE):
-    if not data.get("live"): return
-    if not TELEGRAM_CHAT_ID: return
-    try:
-        await context.bot.send_message(
-            int(TELEGRAM_CHAT_ID),
-            text=prices_menu_text(),
-            parse_mode="Markdown",
-            reply_markup=build_price_keyboard(),
-            disable_web_page_preview=True
+        await app_bot.bot.send_message(
+            chat_id=chat_id,
+            text=ANNOUNCE_TEXT
         )
-    except Exception as e:
-        log.error("auto_ads error: %s", e)
+    except Exception:
+        pass
 
-def cancel_ads(context: ContextTypes.DEFAULT_TYPE):
-    for job in context.job_queue.get_jobs_by_name(f"auto_ads_{TELEGRAM_CHAT_ID or 'chat'}"):
-        job.schedule_removal()
+# --- Bot Handlers ---
+
+async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user:
+        await update.message.reply_text(f"✅ Eres admin (ID: {update.effective_user.id})")
+
+async def addprice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Formato: /addprice Nombre, 12.34
+    if not update.message:
+        return
+    txt = update.message.text or ""
+    try:
+        body = txt.split(" ", 1)[1]
+        name, amount_s = [x.strip() for x in body.split(",", 1)]
+        amount = float(amount_s.replace(",", "."))
+        prices[name] = amount
+        await update.message.reply_text("💰 Precio agregado correctamente.")
+    except Exception:
+        await update.message.reply_text("Formato incorrecto. Usa: /addprice 🍑 Nombre, 5.00")
+
+async def listprices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    await update.message.reply_text("💸 Lista de precios:\n" + prices_menu_text(), parse_mode="Markdown")
 
 async def cmd_liveon(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return await update.effective_chat.send_message("Solo admin.")
-    data["live"] = True; save_data(data)
-    await update.effective_chat.send_message(data.get("welcome") or "¡Bienvenidos al show! 🥳", parse_mode="Markdown")
-    await update.effective_chat.send_message(prices_menu_text(), parse_mode="Markdown", reply_markup=build_price_keyboard())
-    cancel_ads(context)
-    context.job_queue.run_repeating(
-        auto_ads,
-        interval=max(1, AUTO_INTERVAL_MIN) * 60,
-        name=f"auto_ads_{TELEGRAM_CHAT_ID or 'chat'}",
-        first=max(1, AUTO_INTERVAL_MIN) * 60,
+    # marca chat en vivo + publica menú + agenda anuncios
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if not chat_id:
+        return
+    live_chats.add(chat_id)
+
+    kb = InlineKeyboardMarkup(price_rows())
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Hola 👋 ¡Bienvenidos al show!",
     )
-    await update.effective_chat.send_message("🔔 Anuncios automáticos activados.")
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=prices_menu_text(),
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+
+    # programa anuncios cada N minutos usando job_queue del Application
+    # (usamos application.job_queue para evitar None en context.job_queue)
+    application: Application = context.application
+    # cancelamos anteriores para este chat y creamos uno nuevo
+    for job in application.job_queue.get_jobs_by_name(f"auto_ads_{chat_id}"):
+        job.schedule_removal()
+    application.job_queue.run_repeating(
+        lambda ctx: asyncio.create_task(send_announce(application, chat_id)),
+        interval=ANNOUNCE_EVERY_MIN*60,
+        name=f"auto_ads_{chat_id}",
+        first=ANNOUNCE_EVERY_MIN*60
+    )
+
+    await update.message.reply_text("🟢 Live activado.")
 
 async def cmd_liveoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return await update.effective_chat.send_message("Solo admin.")
-    data["live"] = False; save_data(data)
-    cancel_ads(context)
-    await update.effective_chat.send_message("🛑 Live OFF. Anuncios detenidos.")
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if not chat_id:
+        return
+    if chat_id in live_chats:
+        live_chats.remove(chat_id)
+    # cancela anuncios
+    application: Application = context.application
+    for job in application.job_queue.get_jobs_by_name(f"auto_ads_{chat_id}"):
+        job.schedule_removal()
+    await update.message.reply_text("🔴 Live desactivado.")
 
-async def translate_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Sólo cuando está en vivo y en el chat configurado
-    if not data.get("live"): return
-    if not update.message or not update.message.text: return
-    if not TELEGRAM_CHAT_ID or str(update.effective_chat.id) != str(TELEGRAM_CHAT_ID): return
-    txt = update.message.text.strip()
-    if not txt or txt.startswith("/"): return
-    out = translator_safe(txt, TRANSLATE_TO)
-    if out and out.lower() != txt.lower():
-        await update.effective_chat.send_message(f"🌐 {out}")
+# Traducción “ligera”: solo si el chat está en live
+from deep_translator import GoogleTranslator
 
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.exception("handler error: %s", context.error)
+def smart_translate(text: str) -> str:
+    t = text.strip()
+    if not t:
+        return ""
+    lower = t.lower()
+    # detección súper básica
+    if any(ch in lower for ch in ["¿", "¡", "qué", "cómo", "estás", "gracias"]):
+        src, dest = "es", "de"
+    elif any(ch in lower for ch in ["wie", "geht", "danke", "bitte", "und"]):
+        src, dest = "de", "es"
+    else:
+        src, dest = "en", "es"
+    try:
+        return GoogleTranslator(source=src, target=dest).translate(t)
+    except Exception:
+        return ""
 
-application.add_handler(CommandHandler("start",     cmd_start))
-application.add_handler(CommandHandler("whoami",    cmd_whoami))
-application.add_handler(CommandHandler("addprice",  cmd_addprice))
-application.add_handler(CommandHandler("listprices",cmd_listprices))
-application.add_handler(CommandHandler("resetprices",cmd_resetprices))
-application.add_handler(CommandHandler("liveon",    cmd_liveon))
-application.add_handler(CommandHandler("liveoff",   cmd_liveoff))
-application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), translate_in_chat))
-application.add_error_handler(on_error)
+async def on_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_chat:
+        return
+    chat_id = update.effective_chat.id
+    if chat_id not in live_chats:
+        return
+    txt = update.message.text or ""
+    translated = smart_translate(txt)
+    if translated:
+        await update.message.reply_text(f"🌐 {translated}")
 
-# ---------- Flask (Stripe / health) ----------
-app = Flask(__name__)
+# --- Flask (pagos) ---
 
 @app.get("/")
-def root(): return "OK"
+def root_ok():
+    return "OK", 200
 
-@app.get("/healthz")
-def healthz(): return "ok"
+@app.get("/pay")
+def pay():
+    """
+    Genera una sesión de Stripe Checkout y redirige.
+    GET /pay?name=Titten&amount=10.00
+    """
+    if not STRIPE_SK:
+        return "Stripe no configurado", 500
+    name = request.args.get("name", "").strip()
+    amount_s = request.args.get("amount", "0").strip()
+    try:
+        amount = float(amount_s.replace(",", "."))
+    except Exception:
+        return "Monto inválido", 400
+    if not name or amount <= 0:
+        return "Parámetros inválidos", 400
 
-@app.get("/donar")
-def donar():
-    pid = request.args.get("id","").strip()
-    if not pid or pid not in data["prices"]: abort(400, "Opción inválida.")
-    norm = norm_item(pid, data["prices"][pid])
-    if not norm: abort(400, "Opción inválida.")
-    label, amount_num = norm
-    amount = int(round(float(amount_num) * 100))
-    if amount <= 0: abort(400, "Monto inválido.")
-
-    if not stripe.api_key:
-        return f"OK, simulación de donación recibida. Monto: {amount_num:.2f} {CURRENCY} | Item: {label}"
+    # Success URL vuelve a /thanks con session_id y nombre
+    success_url = f"{BASE_URL}/thanks?item={quote_plus(name)}&session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"{BASE_URL}/cancel"
 
     try:
         session = stripe.checkout.Session.create(
             mode="payment",
+            payment_method_types=["card"],
             line_items=[{
                 "price_data": {
                     "currency": CURRENCY.lower(),
-                    "product_data": {"name": safe_stripe_name(label)},
-                    "unit_amount": int(amount)
+                    "product_data": {"name": name},
+                    "unit_amount": int(round(amount * 100))
                 },
                 "quantity": 1
             }],
-            success_url=f"{BASE_URL}/ok",
-            cancel_url=f"{BASE_URL}/cancel",
-            metadata={"display_label": label}
+            success_url=success_url,
+            cancel_url=cancel_url
         )
-        return redirect(session.url, code=303)
     except Exception as e:
-        log.exception("Stripe error"); abort(500, f"Stripe error: {e}")
+        return f"Stripe error: {e}", 500
 
-@app.get("/ok")
-def ok(): return "Gracias por tu apoyo ✅"
+    return redirect(session.url, code=303)
+
+@app.get("/thanks")
+def thanks():
+    """
+    Verifica la sesión y anuncia en el chat + DM a la modelo.
+    """
+    session_id = request.args.get("session_id", "")
+    item = request.args.get("item", "Apoyo")
+    if not session_id:
+        return "Falta session_id", 400
+
+    try:
+        session = stripe.checkout.Session.retrieve(session_id)
+    except Exception as e:
+        return f"Stripe error: {e}", 500
+
+    paid = (session.get("payment_status") == "paid")
+    amount_total = (session.get("amount_total") or 0) / 100.0
+
+    # Avisar por Telegram
+    try:
+        text = f"💥 *Gracias por el apoyo!* {item} — {amount_total:.2f} {CURRENCY}"
+        # Usamos DEFAULT_CHAT_ID si está; si no, no sabemos a qué chat — opcionalmente ignora
+        if DEFAULT_CHAT_ID:
+            asyncio.run(application.bot.send_message(
+                chat_id=int(DEFAULT_CHAT_ID),
+                text=text,
+                parse_mode="Markdown"
+            ))
+        # DM a la modelo
+        if MODEL_USER_ID:
+            asyncio.run(application.bot.send_message(
+                chat_id=int(MODEL_USER_ID),
+                text=f"🔔 Alguien pagó: {item} — {amount_total:.2f} {CURRENCY}"
+            ))
+    except Exception:
+        pass
+
+    html = f"""
+    <html><body>
+    <h3>OK, {"pago recibido" if paid else "pedido registrado"}.</h3>
+    <p>Ítem: {item} — {amount_total:.2f} {CURRENCY}</p>
+    <p>Puedes volver al chat de Telegram.</p>
+    </body></html>
+    """
+    resp = make_response(html, 200)
+    return resp
 
 @app.get("/cancel")
-def cancel(): return "Pago cancelado."
+def cancel():
+    return "Pago cancelado. Vuelve a Telegram.", 200
 
-# ---------- Arranque ----------
-def start_flask():
-    log.info("Iniciando Flask…")
-    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+# --- Arranque: bot hilo principal, Flask en thread ---
+
+def run_flask():
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
 
 if __name__ == "__main__":
-    # Flask en hilo secundario, bot en principal (soluciona asyncio loop)
-    threading.Thread(target=start_flask, daemon=True).start()
-    log.info("Iniciando bot (polling)…")
-    application.run_polling(stop_signals=None, allowed_updates=Update.ALL_TYPES)
+    if not TOKEN:
+        raise SystemExit("Falta TELEGRAM_TOKEN")
+
+    # Iniciar Flask en segundo plano
+    t = threading.Thread(target=run_flask, daemon=True)
+    t.start()
+    time.sleep(0.5)
+
+    # Bot en hilo principal (evita errores de event loop)
+    application = Application.builder().token(TOKEN).build()
+
+    application.add_handler(CommandHandler("whoami", whoami))
+    application.add_handler(CommandHandler("addprice", addprice))
+    application.add_handler(CommandHandler("listprices", listprices))
+    application.add_handler(CommandHandler("liveon", cmd_liveon))
+    application.add_handler(CommandHandler("liveoff", cmd_liveoff))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_chat))
+
+    # JobQueue ya está listo dentro de application; no usamos context.job_queue
+    application.run_polling(close_loop=False)
