@@ -1,15 +1,10 @@
-# -*- coding: utf-8 -*-
-"""
-Cosplay Live Bot – versión estable
-- Telegram + Stripe + anuncios automáticos + traducción básica
-"""
-
 import os
 import threading
-import logging
-from typing import List, Dict
+from datetime import datetime
 
-from flask import Flask, request, redirect, jsonify
+from flask import Flask, request, redirect, abort, jsonify
+
+import stripe
 
 from telegram import (
     Update,
@@ -23,57 +18,84 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-
 from deep_translator import GoogleTranslator
-import stripe
-import asyncio
 
-# -------------------------------------------------------------------
+
+# ==========================
 # CONFIGURACIÓN BÁSICA
-# -------------------------------------------------------------------
+# ==========================
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
-STRIPE_CURRENCY = "eur"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Falta TELEGRAM_TOKEN en variables de entorno")
 
-# URL pública de Render (ajústala si tienes otra)
-PUBLIC_BASE_URL = os.getenv(
-    "PUBLIC_BASE_URL",
-    "https://cosplaylive.onrender.com"
-)
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+if not STRIPE_SECRET_KEY:
+    print("[WARN] STRIPE_SECRET_KEY no está definido. Los pagos no funcionarán.")
 
-# Intervalo de anuncios automáticos (segundos) – 300 = 5 min
-AUTO_AD_INTERVAL = 300
+stripe.api_key = STRIPE_SECRET_KEY
 
-# Mensaje de anuncio automático
-AUTO_AD_TEXT = "🔥 Unterstütze die Show mit einem Klick!\nDas Model bedankt sich live."
-
-# Precios fijos (puedes cambiar los nombres y montos)
-PRICES: List[Dict] = [
-    {"label": "Cute Emoji",      "amount": 5},
-    {"label": "Heart Emoji",     "amount": 7},
-    {"label": "Nice Pose",       "amount": 10},
-    {"label": "Dance Move",      "amount": 15},
-    {"label": "Song Request",    "amount": 20},
-    {"label": "VIP Shoutout",    "amount": 25},
-    {"label": "Special Moment",  "amount": 35},
-]
+BASE_URL = os.environ.get("BASE_URL", "https://cosplaylive.onrender.com")
 
 # Flask
-flask_app = Flask(__name__)
+app = Flask(__name__)
 
-# Application de telegram (se asigna en start_bot)
-tg_app: Application | None = None
+# Telegram Application
+application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+# Traductor (a alemán, desde cualquier idioma)
+translator_de = GoogleTranslator(source="auto", target="de")
 
-# -------------------------------------------------------------------
-# BLOQUE DE ANUNCIOS AUTOMÁTICOS (LIVEON / LIVEOFF)
-# -------------------------------------------------------------------
+# ==========================
+# PRECIOS DEL SHOW (FIJOS)
+# ==========================
+
+PRICES = [
+    {"label": "Quick Tip", "amount": 5},
+    {"label": "Heart Emoji", "amount": 7},
+    {"label": "Nice Pose", "amount": 10},
+    {"label": "Dance Move", "amount": 15},
+    {"label": "Song Request", "amount": 20},
+    {"label": "VIP Shoutout", "amount": 25},
+    {"label": "Special Moment", "amount": 35},
+]
+
+
+def build_prices_keyboard() -> InlineKeyboardMarkup:
+    buttons = []
+    for item in PRICES:
+        label = item["label"]
+        amount = item["amount"]
+        # solo el texto del botón, Stripe usará siempre un texto neutro
+        text = f"{label} · {amount:.2f} EUR"
+
+        # NO mandar emojis ni caracteres raros a Stripe (solo van al chat)
+        from urllib.parse import quote_plus
+
+        safe_label = quote_plus(label)
+
+        url = f"{BASE_URL}/donar?amt={amount:.2f}&label={safe_label}"
+        buttons.append([InlineKeyboardButton(text=text, url=url)])
+
+    return InlineKeyboardMarkup(buttons)
+
+
+def prices_menu_text() -> str:
+    lines = ["🎬 Menú del Show"]
+    for item in PRICES:
+        lines.append(f"• {item['label']} – {item['amount']:.2f} EUR")
+    lines.append("")
+    lines.append("Pulsa un botón para apoyar el show 🔥")
+    return "\n".join(lines)
+
+
+# ==========================
+# ANUNCIOS AUTOMÁTICOS (LIVEON / LIVEOFF)
+# ==========================
+
+AUTO_AD_TEXT = "🔥 Unterstütze die Show mit einem Klick! Das Model bedankt sich live."
+AUTO_AD_JOB_KEY = "auto_ads_job"
+
 
 async def announce_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Job que envía el anuncio automático al chat del show."""
@@ -81,301 +103,264 @@ async def announce_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await context.bot.send_message(chat_id=chat_id, text=AUTO_AD_TEXT)
     except Exception as e:
-        logger.error(f"[announce_job] Error enviando anuncio: {e}")
-
-
-def _job_name_for_chat(chat_id: int) -> str:
-    return f"auto_ads_{chat_id}"
+        print(f"[announce_job] Error enviando anuncio: {e}")
 
 
 async def cmd_liveon(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Activa anuncios automáticos en ESTE chat.
-    Solo se escribe /liveon en la sala de chat de la modelo.
+    Usa /liveon en la sala de chat de la modelo (no en privado).
     """
-    if not update.effective_chat:
+    chat = update.effective_chat
+    if not chat:
         return
 
-    chat = update.effective_chat
-    chat_id = chat.id
-
-    # Eliminar jobs viejos, si hubiera
-    for job in context.job_queue.get_jobs_by_name(_job_name_for_chat(chat_id)):
-        job.schedule_removal()
-
-    # Crear nuevo job
-    context.job_queue.run_repeating(
-        announce_job,
-        interval=AUTO_AD_INTERVAL,
-        first=0,
-        chat_id=chat_id,
-        name=_job_name_for_chat(chat_id),
-    )
-
-    if update.effective_message:
+    # Solo tiene sentido en grupos / supergrupos
+    if chat.type not in ("group", "supergroup"):
         await update.effective_message.reply_text(
-            "🔔 Automatische Show-Hinweise wurden in diesem Chat AKTIVIERT."
+            "Bitte benutze /liveon im Gruppenchat der Show, nicht im Privat-Chat mit dem Bot. 🙂"
         )
+        return
+
+    # Cancelar job anterior si existía
+    existing_job = context.chat_data.get(AUTO_AD_JOB_KEY)
+    if existing_job:
+        existing_job.schedule_removal()
+
+    # Crear job cada 5 minutos, empezando ahora
+    job = context.job_queue.run_repeating(
+        announce_job,
+        interval=300,  # 5 minutos
+        first=0,
+        chat_id=chat.id,
+        name=f"auto_ads_{chat.id}",
+    )
+    context.chat_data[AUTO_AD_JOB_KEY] = job
+
+    # Mandar menú + confirmación
+    await update.effective_message.reply_text(
+        "✅ Automatische Show-Ankündigungen wurden in diesem Chat aktiviert.\n\n"
+        + prices_menu_text(),
+        reply_markup=build_prices_keyboard(),
+    )
 
 
 async def cmd_liveoff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Desactiva los anuncios automáticos en este chat."""
-    if not update.effective_chat:
+    """Desactiva los anuncios automáticos en ESTE chat."""
+    chat = update.effective_chat
+    if not chat:
         return
 
-    chat_id = update.effective_chat.id
-    jobs = context.job_queue.get_jobs_by_name(_job_name_for_chat(chat_id))
-    for job in jobs:
-        job.schedule_removal()
-
-    if update.effective_message:
+    existing_job = context.chat_data.get(AUTO_AD_JOB_KEY)
+    if existing_job:
+        existing_job.schedule_removal()
+        context.chat_data.pop(AUTO_AD_JOB_KEY, None)
         await update.effective_message.reply_text(
-            "🔕 Automatische Show-Hinweise wurden in diesem Chat DEAKTIVIERT."
+            "⛔ Automatische Show-Ankündigungen wurden in diesem Chat deaktiviert."
+        )
+    else:
+        await update.effective_message.reply_text(
+            "Hier sind gerade keine automatischen Ankündigungen aktiv."
         )
 
-# -------------------------------------------------------------------
-# MENÚ DE PRECIOS Y BOTONES DE STRIPE
-# -------------------------------------------------------------------
 
-def build_menu_text() -> str:
-    lines = ["🎬 *Menü der Show*"]
-    for p in PRICES:
-        lines.append(f"• {p['label']} – {p['amount']:.2f} EUR")
-    lines.append("")
-    lines.append("Drücke einen Button, um die Show zu unterstützen 🔥")
-    return "\n".join(lines)
-
-
-async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Muestra el menú del show con los botones de pago."""
-    if not update.effective_chat or not update.effective_user:
-        return
-
-    chat_id = update.effective_chat.id
-    user = update.effective_user
-
-    buttons: List[List[InlineKeyboardButton]] = []
-
-    from urllib.parse import quote_plus
-
-    for p in PRICES:
-        amount = p["amount"]
-        label = p["label"]
-
-        pay_url = (
-            f"{PUBLIC_BASE_URL}/donar"
-            f"?amount={amount}"
-            f"&label={quote_plus(label)}"
-            f"&chat_id={chat_id}"
-            f"&user_name={quote_plus(user.first_name or 'Gast')}"
-        )
-
-        buttons.append(
-            [InlineKeyboardButton(f"{label} · {amount:.2f} EUR", url=pay_url)]
-        )
-
-    text = build_menu_text()
-    await update.effective_message.reply_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
-
+# ==========================
+# COMANDOS BÁSICOS DEL BOT
+# ==========================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Mensaje de inicio."""
-    if not update.effective_message:
-        return
-
     await update.effective_message.reply_text(
-        "Hola 👋\n"
-        "Ich bin dein Cosplay-Live-Bot.\n\n"
-        "Befehle:\n"
-        "• /menu – Preisliste & Buttons\n"
-        "• /liveon – Auto-Hinweise im aktuellen Chat aktivieren\n"
-        "• /liveoff – Auto-Hinweise deaktivieren\n\n"
-        "Schreibe einfach im Chat, ich helfe mit einer Übersetzung ins Deutsche (🌐)."
+        "Hallo! Ich bin der Cosplay Live Bot.\n\n"
+        "• Benutze /liveon im Gruppenchat der Show, um automatische Ankündigungen zu starten.\n"
+        "• Benutze /liveoff, um sie zu stoppen.\n"
+        "• Nachrichten werden automatisch ins Deutsche übersetzt, um dem Model zu helfen. 🇩🇪"
     )
 
-# -------------------------------------------------------------------
-# TRADUCCIÓN BÁSICA EN EL CHAT
-# -------------------------------------------------------------------
+
+async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    await update.effective_message.reply_text(
+        f"✅ Eres admin (ID: {user.id})"
+    )
+
+
+async def cmd_precios(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        prices_menu_text(), reply_markup=build_prices_keyboard()
+    )
+
+
+# ==========================
+# TRADUCCIÓN EN EL CHAT
+# ==========================
 
 async def translate_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Traduce mensajes de usuarios normales al alemán."""
-    message = update.effective_message
-    if not message:
+    msg = update.effective_message
+    if not msg:
+        return
+    if msg.from_user and msg.from_user.is_bot:
         return
 
-    if message.from_user and message.from_user.is_bot:
-        return
-
-    text = message.text or message.caption
+    text = msg.text or msg.caption
     if not text:
         return
 
     try:
-        translated = GoogleTranslator(source="auto", target="de").translate(text)
+        translated = translator_de.translate(text)
     except Exception as e:
-        logger.error(f"[translate_in_chat] Error traduciendo: {e}")
+        print(f"[translate_in_chat] Error traduciendo: {e}")
         return
 
-    # Si la traducción es igual, no hace falta repetir
+    # Si por alguna razón la traducción es igual, no respondemos
     if translated.strip().lower() == text.strip().lower():
         return
 
-    await message.reply_text(f"🌐 {translated}")
-
-# -------------------------------------------------------------------
-# STRIPE: RUTA /donar Y WEBHOOK
-# -------------------------------------------------------------------
-
-stripe.api_key = STRIPE_SECRET_KEY
+    await msg.reply_text(f"🌐 {translated}")
 
 
-@flask_app.route("/")
+# ==========================
+# FLASK: RUTAS WEB / STRIPE
+# ==========================
+
+@app.route("/")
 def index():
-    return "Cosplay Live Bot läuft ✅", 200
+    return (
+        "<h1>Cosplay Live Bot</h1>"
+        "<p>Bot y servidor Flask funcionando.</p>"
+    )
 
 
-@flask_app.route("/donar")
+@app.route("/donar")
 def donar():
-    """Crea una sesión de Stripe Checkout y redirige al usuario."""
     if not STRIPE_SECRET_KEY:
-        return "Stripe Secret Key fehlt", 500
+        return "Stripe no está configurado.", 500
 
-    amount = float(request.args.get("amount", "0"))
+    try:
+        amount = float(request.args.get("amt", "0").replace(",", "."))
+    except ValueError:
+        return "Cantidad inválida", 400
+
+    if amount <= 0:
+        return "Cantidad inválida", 400
+
+    from urllib.parse import unquote_plus
+
     label = request.args.get("label", "Support")
-    chat_id = request.args.get("chat_id", "")
-    user_name = request.args.get("user_name", "Gast")
-
-    if amount <= 0 or not chat_id:
-        return "Ungültige Parameter", 400
-
-    # Stripe trabaja en centavos
-    unit_amount = int(amount * 100)
+    label = unquote_plus(label)
 
     try:
         session = stripe.checkout.Session.create(
             mode="payment",
-            payment_method_types=["card"],
             line_items=[
                 {
                     "price_data": {
-                        "currency": STRIPE_CURRENCY,
-                        "product_data": {"name": label},
-                        "unit_amount": unit_amount,
+                        "currency": "eur",
+                        "unit_amount": int(amount * 100),
+                        "product_data": {
+                            # Texto neutro en Stripe, sin palabras raras
+                            "name": "Chat Support",
+                        },
                     },
                     "quantity": 1,
                 }
             ],
-            success_url=f"{PUBLIC_BASE_URL}/ok",
-            cancel_url=f"{PUBLIC_BASE_URL}/cancel",
+            success_url=BASE_URL + "/ok",
+            cancel_url=BASE_URL + "/cancel",
             metadata={
-                "chat_id": str(chat_id),
-                "user_name": user_name,
                 "label": label,
-                "amount": str(amount),
+                "amount": f"{amount:.2f}",
+                "created_at": datetime.utcnow().isoformat(),
             },
         )
     except Exception as e:
-        logger.error(f"[donar] Error creando sesión de Stripe: {e}")
-        return "Stripe Fehler", 500
+        print(f"[donar] Error creando sesión Stripe: {e}")
+        return "Stripe error", 500
 
-    # Redirigimos directamente a la página de pago
+    # Redirigir directamente a Stripe
     return redirect(session.url, code=303)
 
 
-@flask_app.route("/ok")
+@app.route("/ok")
 def ok():
-    return "✅ Zahlung erfolgreich. Danke für deinen Support!", 200
+    return "<h2>Danke für deine Unterstützung! 🎉</h2>"
 
 
-@flask_app.route("/cancel")
+@app.route("/cancel")
 def cancel():
-    return "Zahlung abgebrochen.", 200
+    return "<h2>Die Zahlung wurde abgebrochen.</h2>"
 
 
-@flask_app.route("/stripe/webhook", methods=["POST"])
+# Webhook Stripe (opcional – si no hay secreto, solo responde 200)
+@app.route("/stripe/webhook", methods=["POST"])
 def stripe_webhook():
-    """Recibe eventos de Stripe y manda el superchat al chat de la modelo."""
+    endpoint_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
+    if not endpoint_secret:
+        # No configurado -> ignorar pero no romper
+        return "", 200
+
     payload = request.data
     sig_header = request.headers.get("Stripe-Signature", "")
-    endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 
-    event = None
     try:
-        if endpoint_secret:
-            event = stripe.Webhook.construct_event(
-                payload, sig_header, endpoint_secret
-            )
-        else:
-            # Sin verificación (solo pruebas)
-            event = stripe.Event.construct_from(
-                jsonify(payload).json, stripe.api_key
-            )
+        event = stripe.Webhook.construct_event(payload, sig_header, endpoint_secret)
     except Exception as e:
-        logger.error(f"[stripe_webhook] Error verificando webhook: {e}")
-        return "Webhook error", 400
+        print(f"[stripe_webhook] Error verificando firma: {e}")
+        return str(e), 400
 
-    if event and event["type"] == "checkout.session.completed":
+    if event.get("type") == "checkout.session.completed":
         session = event["data"]["object"]
         meta = session.get("metadata", {}) or {}
-        chat_id = meta.get("chat_id")
-        user_name = meta.get("user_name", "Ein Fan")
         label = meta.get("label", "Support")
-        amount = meta.get("amount", "")
+        amount = meta.get("amount", "0.00")
 
-        if chat_id and tg_app:
-            text = (
-                f"💥 Neue Spende!\n"
-                f"👤 *{user_name}* hat *{label}* für *{amount} €* gekauft.\n"
-                f"Das Model bedankt sich live! 🙏"
-            )
+        # Mensaje simple de agradecimiento (en el futuro se puede mejorar)
+        text = f"💥 Danke für die Unterstützung! ({label} · {amount} EUR)"
 
+        # Enviamos al chat donde esté configurado el LIVEON
+        # Por simplicidad, lo mandamos al admin (puedes cambiar después)
+        admin_id_str = os.environ.get("ADMIN_CHAT_ID")
+        if admin_id_str:
             try:
-                tg_app.create_task(
-                    tg_app.bot.send_message(
-                        chat_id=int(chat_id),
-                        text=text,
-                        parse_mode="Markdown",
-                    )
+                admin_id = int(admin_id_str)
+                # usamos create_task para no bloquear Flask
+                application.create_task(
+                    application.bot.send_message(chat_id=admin_id, text=text)
                 )
             except Exception as e:
-                logger.error(f"[stripe_webhook] Error enviando superchat: {e}")
+                print(f"[stripe_webhook] Error enviando mensaje a Telegram: {e}")
 
-    return "OK", 200
+    return "", 200
 
-# -------------------------------------------------------------------
-# ARRANQUE DEL BOT (TELEGRAM) + FLASK
-# -------------------------------------------------------------------
+
+# ==========================
+# REGISTRO DE HANDLERS
+# ==========================
+
+application.add_handler(CommandHandler("start", cmd_start))
+application.add_handler(CommandHandler("whoami", cmd_whoami))
+application.add_handler(CommandHandler("precios", cmd_precios))
+application.add_handler(CommandHandler("liveon", cmd_liveon))
+application.add_handler(CommandHandler("liveoff", cmd_liveoff))
+
+# Traducción para todos los mensajes de texto en grupos donde esté el bot
+application.add_handler(
+    MessageHandler(filters.TEXT & (~filters.COMMAND), translate_in_chat)
+)
+
+
+# ==========================
+# ARRANQUE BOT + FLASK
+# ==========================
 
 def start_bot():
-    """Arranca el bot de Telegram en un hilo separado."""
-    global tg_app
+    # stop_signals=None porque corremos en un hilo secundario
+    application.run_polling(drop_pending_updates=True, stop_signals=None)
 
-    if not TELEGRAM_TOKEN:
-        logger.error("TELEGRAM_TOKEN no está configurado.")
-        return
 
-    # *** IMPORTANTE: crear event loop en este hilo ***
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # Guardamos la instancia global para usarla en el webhook
-    tg_app = application
-
-    logger.info("Bot de Telegram iniciando con run_polling()...")
-    application.run_polling(drop_pending_updates=True)
+bot_thread = threading.Thread(target=start_bot, name="tg-bot", daemon=True)
+bot_thread.start()
 
 
 if __name__ == "__main__":
-    # Hilo para el bot
-    bot_thread = threading.Thread(target=start_bot, name="tg-bot", daemon=True)
-    bot_thread.start()
-
-    port = int(os.getenv("PORT", "10000"))
-    logger.info(f"Servidor Flask escuchando en puerto {port}")
-    flask_app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
