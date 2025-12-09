@@ -1,16 +1,11 @@
 import os
 import threading
 from datetime import datetime
+from collections import defaultdict
 
-from flask import Flask, request, redirect, abort, jsonify
+from flask import Flask, request, jsonify
 
-import stripe
-
-from telegram import (
-    Update,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -20,7 +15,6 @@ from telegram.ext import (
 )
 from deep_translator import GoogleTranslator
 
-
 # ==========================
 # CONFIGURACIÓN BÁSICA
 # ==========================
@@ -29,139 +23,43 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Falta TELEGRAM_TOKEN en variables de entorno")
 
-STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
-if not STRIPE_SECRET_KEY:
-    print("[WARN] STRIPE_SECRET_KEY no está definido. Los pagos no funcionarán.")
-
-stripe.api_key = STRIPE_SECRET_KEY
-
+# URL base de tu servicio en Render (para construir los links de overlay)
 BASE_URL = os.environ.get("BASE_URL", "https://cosplaylive.onrender.com")
 
 # Flask
 app = Flask(__name__)
 
-# Telegram Application
+# Telegram Application (async, PTB v20)
 application = Application.builder().token(TELEGRAM_TOKEN).build()
 
 # Traductor (a alemán, desde cualquier idioma)
 translator_de = GoogleTranslator(source="auto", target="de")
 
 # ==========================
-# PRECIOS DEL SHOW (FIJOS)
+# LOG DE CHAT PARA MIRROR / HUD
 # ==========================
 
-PRICES = [
-    {"label": "Quick Tip", "amount": 5},
-    {"label": "Heart Emoji", "amount": 7},
-    {"label": "Nice Pose", "amount": 10},
-    {"label": "Dance Move", "amount": 15},
-    {"label": "Song Request", "amount": 20},
-    {"label": "VIP Shoutout", "amount": 25},
-    {"label": "Special Moment", "amount": 35},
-]
+CHAT_LOGS = defaultdict(list)
+MAX_LOG_MESSAGES = 200
 
 
-def build_prices_keyboard() -> InlineKeyboardMarkup:
-    buttons = []
-    for item in PRICES:
-        label = item["label"]
-        amount = item["amount"]
-        # solo el texto del botón, Stripe usará siempre un texto neutro
-        text = f"{label} · {amount:.2f} EUR"
-
-        # NO mandar emojis ni caracteres raros a Stripe (solo van al chat)
-        from urllib.parse import quote_plus
-
-        safe_label = quote_plus(label)
-
-        url = f"{BASE_URL}/donar?amt={amount:.2f}&label={safe_label}"
-        buttons.append([InlineKeyboardButton(text=text, url=url)])
-
-    return InlineKeyboardMarkup(buttons)
-
-
-def prices_menu_text() -> str:
-    lines = ["🎬 Menú del Show"]
-    for item in PRICES:
-        lines.append(f"• {item['label']} – {item['amount']:.2f} EUR")
-    lines.append("")
-    lines.append("Pulsa un botón para apoyar el show 🔥")
-    return "\n".join(lines)
-
-
-# ==========================
-# ANUNCIOS AUTOMÁTICOS (LIVEON / LIVEOFF)
-# ==========================
-
-AUTO_AD_TEXT = "🔥 Unterstütze die Show mit einem Klick! Das Model bedankt sich live."
-AUTO_AD_JOB_KEY = "auto_ads_job"
-
-
-async def announce_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Job que envía el anuncio automático al chat del show."""
-    chat_id = context.job.chat_id
-    try:
-        await context.bot.send_message(chat_id=chat_id, text=AUTO_AD_TEXT)
-    except Exception as e:
-        print(f"[announce_job] Error enviando anuncio: {e}")
-
-
-async def cmd_liveon(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def add_chat_log(chat_id: int, user_display: str, text: str, translated: str):
     """
-    Activa anuncios automáticos en ESTE chat.
-    Usa /liveon en la sala de chat de la modelo (no en privado).
+    Guarda un mensaje en el log de un chat para mostrarlo en el overlay/HUD.
     """
-    chat = update.effective_chat
-    if not chat:
+    if not text:
         return
-
-    # Solo tiene sentido en grupos / supergrupos
-    if chat.type not in ("group", "supergroup"):
-        await update.effective_message.reply_text(
-            "Bitte benutze /liveon im Gruppenchat der Show, nicht im Privat-Chat mit dem Bot. 🙂"
-        )
-        return
-
-    # Cancelar job anterior si existía
-    existing_job = context.chat_data.get(AUTO_AD_JOB_KEY)
-    if existing_job:
-        existing_job.schedule_removal()
-
-    # Crear job cada 5 minutos, empezando ahora
-    job = context.job_queue.run_repeating(
-        announce_job,
-        interval=300,  # 5 minutos
-        first=0,
-        chat_id=chat.id,
-        name=f"auto_ads_{chat.id}",
-    )
-    context.chat_data[AUTO_AD_JOB_KEY] = job
-
-    # Mandar menú + confirmación
-    await update.effective_message.reply_text(
-        "✅ Automatische Show-Ankündigungen wurden in diesem Chat aktiviert.\n\n"
-        + prices_menu_text(),
-        reply_markup=build_prices_keyboard(),
-    )
-
-
-async def cmd_liveoff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Desactiva los anuncios automáticos en ESTE chat."""
-    chat = update.effective_chat
-    if not chat:
-        return
-
-    existing_job = context.chat_data.get(AUTO_AD_JOB_KEY)
-    if existing_job:
-        existing_job.schedule_removal()
-        context.chat_data.pop(AUTO_AD_JOB_KEY, None)
-        await update.effective_message.reply_text(
-            "⛔ Automatische Show-Ankündigungen wurden in diesem Chat deaktiviert."
-        )
-    else:
-        await update.effective_message.reply_text(
-            "Hier sind gerade keine automatischen Ankündigungen aktiv."
-        )
+    entry = {
+        "time": datetime.utcnow().strftime("%H:%M:%S"),
+        "user": user_display,
+        "text": text,
+        "translated": translated or "",
+    }
+    lst = CHAT_LOGS[chat_id]
+    lst.append(entry)
+    # Limitamos el tamaño del log
+    if len(lst) > MAX_LOG_MESSAGES:
+        CHAT_LOGS[chat_id] = lst[-100:]
 
 
 # ==========================
@@ -169,24 +67,62 @@ async def cmd_liveoff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ==========================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Mensaje de bienvenida: explica traducción + overlays.
+    """
     await update.effective_message.reply_text(
-        "Hallo! Ich bin der Cosplay Live Bot.\n\n"
-        "• Benutze /liveon im Gruppenchat der Show, um automatische Ankündigungen zu starten.\n"
-        "• Benutze /liveoff, um sie zu stoppen.\n"
-        "• Nachrichten werden automatisch ins Deutsche übersetzt, um dem Model zu helfen. 🇩🇪"
+        "Hallo! Ich bin der Cosplay Live Helper Bot. 🧋\n\n"
+        "Funktionen:\n"
+        "• Übersetzt Nachrichten automatisch ins Deutsche, damit das Model alles versteht. 🇩🇪\n"
+        "• /overlaylink – gibt dir einen Link zum Spiegel (Mirror) des Chats.\n"
+        "• /overlayhud – gibt dir einen Link zu einem transparenten HUD-Overlay,\n"
+        "  das du als schwebendes Fenster über deiner Kamera verwenden kannst."
     )
 
 
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Solo informa el ID del usuario (útil para debug).
+    """
     user = update.effective_user
+    await update.effective_message.reply_text(f"✅ Dein User-ID ist: {user.id}")
+
+
+async def cmd_overlaylink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Devuelve el link del overlay clásico (lista de mensajes) para el chat actual.
+    """
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    chat_id = chat.id
+    overlay_url = f"{BASE_URL}/overlay?chat_id={chat_id}"
+
     await update.effective_message.reply_text(
-        f"✅ Eres admin (ID: {user.id})"
+        "🪞 Spiegel / Mirror dieses Chats:\n"
+        f"{overlay_url}\n\n"
+        "Öffne diesen Link z.B. auf einem zweiten Gerät, um den Chat groß zu sehen."
     )
 
 
-async def cmd_precios(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_overlayhud(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Devuelve el link del HUD transparente para el chat actual.
+    Ideal para usarlo en un navegador flotante sobre la pantalla.
+    """
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    chat_id = chat.id
+    hud_url = f"{BASE_URL}/overlayhud?chat_id={chat_id}"
+
     await update.effective_message.reply_text(
-        prices_menu_text(), reply_markup=build_prices_keyboard()
+        "🪞 Transparentes HUD-Overlay für diesen Chat:\n"
+        f"{hud_url}\n\n"
+        "Tipp: Öffne diesen Link in einem schwebenden/Overlay-Browser, "
+        "dann siehst du die Kamera in Telegram und den Chat darüber."
     )
 
 
@@ -195,6 +131,10 @@ async def cmd_precios(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ==========================
 
 async def translate_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Traduce cada mensaje de texto al alemán y responde con la traducción,
+    además de guardarlo en el log para el overlay/HUD.
+    """
     msg = update.effective_message
     if not msg:
         return
@@ -205,13 +145,32 @@ async def translate_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not text:
         return
 
+    # Nombre amigable del usuario
+    user = msg.from_user
+    if user:
+        if user.username:
+            user_display = f"@{user.username}"
+        else:
+            fullname = (user.first_name or "") + " " + (user.last_name or "" if user.last_name else "")
+            user_display = fullname.strip() or "User"
+    else:
+        user_display = "User"
+
+    translated = ""
     try:
         translated = translator_de.translate(text)
     except Exception as e:
         print(f"[translate_in_chat] Error traduciendo: {e}")
-        return
+        translated = ""
 
-    # Si por alguna razón la traducción es igual, no respondemos
+    # Guardar en el log del chat (con o sin traducción)
+    chat = update.effective_chat
+    if chat:
+        add_chat_log(chat.id, user_display, text, translated)
+
+    # Si la traducción es vacía o igual al original, no respondemos
+    if not translated:
+        return
     if translated.strip().lower() == text.strip().lower():
         return
 
@@ -219,117 +178,255 @@ async def translate_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 # ==========================
-# FLASK: RUTAS WEB / STRIPE
+# FLASK: RUTAS WEB (OVERLAYS)
 # ==========================
 
 @app.route("/")
 def index():
     return (
-        "<h1>Cosplay Live Bot</h1>"
-        "<p>Bot y servidor Flask funcionando.</p>"
+        "<h1>Cosplay Live Helper Bot</h1>"
+        "<p>Bot de traducción y overlays funcionando.</p>"
+        "<p>Usa /overlaylink o /overlayhud en Telegram para obtener los enlaces.</p>"
     )
 
 
-@app.route("/donar")
-def donar():
-    if not STRIPE_SECRET_KEY:
-        return "Stripe no está configurado.", 500
-
-    try:
-        amount = float(request.args.get("amt", "0").replace(",", "."))
-    except ValueError:
-        return "Cantidad inválida", 400
-
-    if amount <= 0:
-        return "Cantidad inválida", 400
-
-    from urllib.parse import unquote_plus
-
-    label = request.args.get("label", "Support")
-    label = unquote_plus(label)
-
-    try:
-        session = stripe.checkout.Session.create(
-            mode="payment",
-            line_items=[
-                {
-                    "price_data": {
-                        "currency": "eur",
-                        "unit_amount": int(amount * 100),
-                        "product_data": {
-                            # Texto neutro en Stripe, sin palabras raras
-                            "name": "Chat Support",
-                        },
-                    },
-                    "quantity": 1,
-                }
-            ],
-            success_url=BASE_URL + "/ok",
-            cancel_url=BASE_URL + "/cancel",
-            metadata={
-                "label": label,
-                "amount": f"{amount:.2f}",
-                "created_at": datetime.utcnow().isoformat(),
-            },
+@app.route("/overlay")
+def overlay():
+    """
+    Página HTML que muestra el mirror del chat (lista completa de mensajes).
+    Se llama con ?chat_id=<id>.
+    """
+    chat_id = request.args.get("chat_id", "").strip()
+    if not chat_id:
+        return (
+            "<h2>Overlay / Mirror</h2>"
+            "<p>Falta el parámetro <code>chat_id</code>.</p>"
+            "<p>Genera el enlace desde Telegram con /overlaylink en el Chat.</p>"
         )
-    except Exception as e:
-        print(f"[donar] Error creando sesión Stripe: {e}")
-        return "Stripe error", 500
 
-    # Redirigir directamente a Stripe
-    return redirect(session.url, code=303)
+    html = f"""
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8" />
+<title>Chat Overlay</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<style>
+    body {{
+        margin: 0;
+        padding: 0;
+        background: #000;
+        color: #fff;
+        font-family: system-ui, sans-serif;
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+    }}
+    header {{
+        padding: 8px 12px;
+        font-size: 14px;
+        background: #111;
+        border-bottom: 1px solid #333;
+    }}
+    #chat {{
+        flex: 1;
+        overflow-y: auto;
+        padding: 8px;
+    }}
+    .msg {{
+        margin-bottom: 8px;
+        padding: 6px 8px;
+        border-radius: 6px;
+        background: #111;
+        border: 1px solid #333;
+        font-size: 14px;
+    }}
+    .meta {{
+        font-size: 11px;
+        color: #aaa;
+        margin-bottom: 3px;
+    }}
+    .original {{
+        font-size: 13px;
+        color: #eee;
+    }}
+    .translated {{
+        font-size: 13px;
+        color: #6cf;
+        margin-top: 3px;
+    }}
+</style>
+</head>
+<body>
+<header>
+    Chat Overlay – Chat ID: {chat_id}
+</header>
+<div id="chat"></div>
+
+<script>
+const chatId = "{chat_id}";
+const chatDiv = document.getElementById('chat');
+
+async function loadMessages() {{
+    try {{
+        const res = await fetch('/overlay_data?chat_id=' + encodeURIComponent(chatId));
+        if (!res.ok) return;
+        const data = await res.json();
+        const msgs = data.messages || [];
+        chatDiv.innerHTML = '';
+
+        for (const m of msgs) {{
+            const div = document.createElement('div');
+            div.className = 'msg';
+
+            const meta = document.createElement('div');
+            meta.className = 'meta';
+            meta.textContent = `[${{m.time}}] ${{m.user}}`;
+            div.appendChild(meta);
+
+            const orig = document.createElement('div');
+            orig.className = 'original';
+            orig.textContent = m.text || '';
+            div.appendChild(orig);
+
+            if (m.translated && m.translated.trim() !== '') {{
+                const tr = document.createElement('div');
+                tr.className = 'translated';
+                tr.textContent = '🌐 ' + m.translated;
+                div.appendChild(tr);
+            }}
+
+            chatDiv.appendChild(div);
+        }}
+
+        chatDiv.scrollTop = chatDiv.scrollHeight;
+    }} catch (e) {{
+        console.error('Error loading messages', e);
+    }}
+}}
+
+loadMessages();
+setInterval(loadMessages, 2000);
+</script>
+</body>
+</html>
+    """
+    return html
 
 
-@app.route("/ok")
-def ok():
-    return "<h2>Danke für deine Unterstützung! 🎉</h2>"
-
-
-@app.route("/cancel")
-def cancel():
-    return "<h2>Die Zahlung wurde abgebrochen.</h2>"
-
-
-# Webhook Stripe (opcional – si no hay secreto, solo responde 200)
-@app.route("/stripe/webhook", methods=["POST"])
-def stripe_webhook():
-    endpoint_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
-    if not endpoint_secret:
-        # No configurado -> ignorar pero no romper
-        return "", 200
-
-    payload = request.data
-    sig_header = request.headers.get("Stripe-Signature", "")
+@app.route("/overlay_data")
+def overlay_data():
+    """
+    Devuelve los mensajes del chat en JSON para el overlay / HUD.
+    """
+    chat_id = request.args.get("chat_id", "").strip()
+    if not chat_id:
+        return jsonify({"messages": []})
 
     try:
-        event = stripe.Webhook.construct_event(payload, sig_header, endpoint_secret)
-    except Exception as e:
-        print(f"[stripe_webhook] Error verificando firma: {e}")
-        return str(e), 400
+        cid = int(chat_id)
+    except ValueError:
+        return jsonify({"messages": []})
 
-    if event.get("type") == "checkout.session.completed":
-        session = event["data"]["object"]
-        meta = session.get("metadata", {}) or {}
-        label = meta.get("label", "Support")
-        amount = meta.get("amount", "0.00")
+    msgs = CHAT_LOGS.get(cid, [])
+    return jsonify({"messages": msgs})
 
-        # Mensaje simple de agradecimiento (en el futuro se puede mejorar)
-        text = f"💥 Danke für die Unterstützung! ({label} · {amount} EUR)"
 
-        # Enviamos al chat donde esté configurado el LIVEON
-        # Por simplicidad, lo mandamos al admin (puedes cambiar después)
-        admin_id_str = os.environ.get("ADMIN_CHAT_ID")
-        if admin_id_str:
-            try:
-                admin_id = int(admin_id_str)
-                # usamos create_task para no bloquear Flask
-                application.create_task(
-                    application.bot.send_message(chat_id=admin_id, text=text)
-                )
-            except Exception as e:
-                print(f"[stripe_webhook] Error enviando mensaje a Telegram: {e}")
+@app.route("/overlayhud")
+def overlay_hud():
+    """
+    HUD transparente para superponer sobre la pantalla.
+    Muestra hasta 3 mensajes recientes, con fondo semitransparente.
+    Ideal para usar en un navegador flotante / Picture-in-Picture.
+    """
+    chat_id = request.args.get("chat_id", "").strip()
+    if not chat_id:
+        return "<h3>Falta chat_id</h3>"
 
-    return "", 200
+    html = f"""
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8" />
+<title>HUD Overlay</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+<style>
+    body {{
+        margin: 0;
+        padding: 0;
+        background: rgba(0,0,0,0);
+        font-family: system-ui, sans-serif;
+        overflow: hidden;
+    }}
+
+    #msgs {{
+        position: fixed;
+        bottom: 5%;
+        left: 5%;
+        right: 5%;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        color: #ffffff;
+        font-size: 22px;
+        text-shadow: 0px 0px 5px #000;
+        pointer-events: none; /* para que no interfiera con toques en pantalla */
+    }}
+
+    .msg {{
+        background: rgba(0,0,0,0.35);
+        padding: 8px 12px;
+        border-radius: 10px;
+        animation: fadein 0.4s ease-out;
+    }}
+
+    @keyframes fadein {{
+        from {{ opacity: 0; transform: translateY(20px); }}
+        to {{ opacity: 1; transform: translateY(0); }}
+    }}
+</style>
+</head>
+
+<body>
+<div id="msgs"></div>
+
+<script>
+const chatId = "{chat_id}";
+const div = document.getElementById("msgs");
+
+async function loadHUD() {{
+    try {{
+        const res = await fetch("/overlay_data?chat_id=" + encodeURIComponent(chatId));
+        const data = await res.json();
+        const list = data.messages || [];
+
+        const last = list.slice(-3);  // últimos 3 mensajes
+        div.innerHTML = "";
+
+        last.forEach(m => {{
+            const d = document.createElement("div");
+            d.className = "msg";
+            const translated = m.translated || "";
+            d.innerHTML = `
+                <b>${{m.user}}:</b> ${{m.text}}<br>
+                <span style="color:#6cf;">${{translated}}</span>
+            `;
+            div.appendChild(d);
+        }});
+    }} catch (e) {{
+        console.error("HUD error", e);
+    }}
+}}
+
+setInterval(loadHUD, 1500);
+loadHUD();
+</script>
+
+</body>
+</html>
+    """
+    return html
 
 
 # ==========================
@@ -338,11 +435,10 @@ def stripe_webhook():
 
 application.add_handler(CommandHandler("start", cmd_start))
 application.add_handler(CommandHandler("whoami", cmd_whoami))
-application.add_handler(CommandHandler("precios", cmd_precios))
-application.add_handler(CommandHandler("liveon", cmd_liveon))
-application.add_handler(CommandHandler("liveoff", cmd_liveoff))
+application.add_handler(CommandHandler("overlaylink", cmd_overlaylink))
+application.add_handler(CommandHandler("overlayhud", cmd_overlayhud))
 
-# Traducción para todos los mensajes de texto en grupos donde esté el bot
+# Traducción para todos los mensajes de texto en chats donde esté el bot
 application.add_handler(
     MessageHandler(filters.TEXT & (~filters.COMMAND), translate_in_chat)
 )
@@ -353,7 +449,7 @@ application.add_handler(
 # ==========================
 
 def start_bot():
-    # stop_signals=None porque corremos en un hilo secundario
+    # stop_signals=None porque corremos en un hilo secundario (junto a Flask)
     application.run_polling(drop_pending_updates=True, stop_signals=None)
 
 
