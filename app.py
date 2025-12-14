@@ -1,383 +1,339 @@
 import json
 import logging
 import os
-from datetime import datetime
 from threading import Thread
+from typing import Dict, Optional
 
 from flask import Flask
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram import Update, ParseMode
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 
-# ───────────────────────── LOGGING ─────────────────────────
+from deep_translator import GoogleTranslator
 
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+# ───────────────── CONFIG BÁSICA ─────────────────
+
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
-logger = logging.getLogger("cosplaylive")
+logger = logging.getLogger("cosplaylive_translate")
 
-# ───────────────────────── ENV ─────────────────────────
-
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TOKEN = os.environ.get("TELEGRAM_TOKEN") or os.environ.get("TELEGRAM_ANNOUNCE")
 if not TOKEN:
-    raise RuntimeError("Falta TELEGRAM_BOT_TOKEN en Render")
+    raise RuntimeError("Falta TELEGRAM_TOKEN (o TELEGRAM_ANNOUNCE) en Render")
 
 DATA_DIR = os.environ.get("DATA_DIR", "/var/data")
 os.makedirs(DATA_DIR, exist_ok=True)
-DATA_FILE = os.path.join(DATA_DIR, "data.json")
 
-# Traducción
-ENABLE_TRANSLATION = os.environ.get("ENABLE_TRANSLATION", "1").strip().lower() in ("1", "true", "yes", "on")
-TRANSLATE_TO = os.environ.get("TRANSLATE_TO", "de").strip()  # público -> alemán (salida para público)
-TRANSLATE_MODEL_TO = os.environ.get("TRANSLATE_MODEL_TO", "pt").strip()  # público -> modelo (portugués)
-MAX_TEXT = int(os.environ.get("MAX_TEXT", "3500"))
+ROOMS_FILE = os.path.join(DATA_DIR, "rooms.json")   # model_user_id -> group_chat_id
+MODELS_FILE = os.path.join(DATA_DIR, "models.json") # model_user_id -> model_name
+LIVE_FILE = os.path.join(DATA_DIR, "live.json")     # model_user_id -> true/false
 
-# Admin (tu user_id para proteger comandos). Puedes poner varios separados por coma.
-ADMIN_IDS = set()
-_raw_admins = os.environ.get("ADMIN_IDS", "").strip()
-if _raw_admins:
-    for part in _raw_admins.split(","):
-        part = part.strip()
-        if part.isdigit():
-            ADMIN_IDS.add(int(part))
+# Traducción (coloquial)
+# Grupo suele ser alemán -> modelo portugués
+translator_de_to_pt = GoogleTranslator(source="de", target="pt")
+# Modelo portugués -> grupo alemán
+translator_pt_to_de = GoogleTranslator(source="pt", target="de")
 
-# ───────────────────────── STORAGE ─────────────────────────
-# data.json estructura:
-# {
-#   "sessions": {
-#     "<model_user_id>": {
-#       "group_chat_id": -100...,         # chat/grupo donde escriben los usuarios (chat del live)
-#       "model_name": "Aurora",
-#       "enabled": true
-#     }
-#   }
-# }
+# ───────────────── UTILIDADES JSON ─────────────────
 
-def load_data():
+def load_json(path: str, default):
     try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
-        return {"sessions": {}}
+        return default
     except Exception as e:
-        logger.error(f"Error leyendo data.json: {e}")
-        return {"sessions": {}}
+        logger.error(f"Error cargando {path}: {e}")
+        return default
 
-def save_data(data):
+def save_json(path: str, data):
     try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.error(f"Error guardando data.json: {e}")
+        logger.error(f"Error guardando {path}: {e}")
 
-def get_session(model_user_id: int):
-    data = load_data()
-    return data.get("sessions", {}).get(str(model_user_id))
+def load_rooms() -> Dict[str, int]:
+    return load_json(ROOMS_FILE, {})
 
-def set_session(model_user_id: int, session_obj: dict):
-    data = load_data()
-    data.setdefault("sessions", {})
-    data["sessions"][str(model_user_id)] = session_obj
-    save_data(data)
+def save_rooms(d: Dict[str, int]):
+    save_json(ROOMS_FILE, d)
 
-def is_admin(user_id: int) -> bool:
-    # Si no configuraste ADMIN_IDS, dejamos pasar igual (modo simple).
-    return (not ADMIN_IDS) or (user_id in ADMIN_IDS)
+def load_models() -> Dict[str, str]:
+    return load_json(MODELS_FILE, {})
 
-# ───────────────────────── TRANSLATOR ─────────────────────────
+def save_models(d: Dict[str, str]):
+    save_json(MODELS_FILE, d)
 
-_TRANSLATOR_OK = False
-if ENABLE_TRANSLATION:
-    try:
-        from deep_translator import GoogleTranslator
-        _TRANSLATOR_OK = True
-    except Exception as e:
-        logger.warning(f"ENABLE_TRANSLATION=1 pero deep-translator no está disponible: {e}")
+def load_live() -> Dict[str, bool]:
+    return load_json(LIVE_FILE, {})
 
-def translate_text(text: str, target: str) -> str:
-    """Traduce de auto -> target. Si falla, devuelve el texto original."""
-    if not ENABLE_TRANSLATION or not _TRANSLATOR_OK:
-        return text
-    try:
-        # auto-detect
-        out = GoogleTranslator(source="auto", target=target).translate(text)
-        return out or text
-    except Exception as e:
-        logger.warning(f"Falló traducción ({target}): {e}")
-        return text
+def save_live(d: Dict[str, bool]):
+    save_json(LIVE_FILE, d)
 
-def safe_trim(text: str) -> str:
-    text = (text or "").strip()
-    if len(text) > MAX_TEXT:
-        return text[:MAX_TEXT] + "…"
-    return text
+def get_model_name(user_id: int) -> str:
+    models = load_models()
+    return models.get(str(user_id), "Model")
 
-def user_label(update: Update) -> str:
-    u = update.effective_user
-    if not u:
-        return "User"
-    # nombre visible + @username si existe
-    name = (u.full_name or "User").strip()
-    if u.username:
-        return f"{name} (@{u.username})"
-    return name
+def is_live(user_id: int) -> bool:
+    live = load_live()
+    return bool(live.get(str(user_id), False))
 
-# ───────────────────────── COMMANDS ─────────────────────────
+def set_live(user_id: int, on: bool):
+    live = load_live()
+    live[str(user_id)] = on
+    save_live(live)
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (
-        "✅ <b>CosplayLive – Translator Mode</b>\n\n"
-        "Este bot sirve para traducir en vivo:\n"
-        "• Chat del live (usuarios) → Portugués para la modelo\n"
-        "• Modelo → Alemán para el chat\n\n"
-        "<b>Comandos (en privado con el bot):</b>\n"
-        "• /whereami  (úsalo en el chat del live para ver el Chat ID)\n"
-        "• /setroom <CHAT_ID>  (guardar el chat del live para TU cuenta)\n"
-        "• /setmodel <Nombre>  (guardar tu nombre)\n"
-        "• /liveon  (activar puente traducción)\n"
-        "• /liveoff (desactivar)\n\n"
-        "Notas:\n"
-        "• La modelo escribe al bot en privado → el bot lo publica traducido.\n"
-        "• Los usuarios escriben en el chat del live → el bot se lo manda traducido a la modelo.\n"
+def get_room_for_model(user_id: int) -> Optional[int]:
+    rooms = load_rooms()
+    cid = rooms.get(str(user_id))
+    return cid
+
+def find_model_by_room(chat_id: int) -> Optional[int]:
+    """Encuentra qué modelo está vinculada a este grupo."""
+    rooms = load_rooms()
+    for uid_str, room_id in rooms.items():
+        if int(room_id) == int(chat_id):
+            return int(uid_str)
+    return None
+
+# ───────────────── “COLOQUIALIZAR” ALEMÁN ─────────────────
+
+def make_german_more_casual(text: str) -> str:
+    """
+    Ajuste ligero para que suene menos formal.
+    No es perfecto, pero ayuda bastante.
+    """
+    t = text
+    # cambios simples
+    t = t.replace("Sie ", "du ").replace(" Ihnen", " dir").replace("Ihr ", "dein ")
+    t = t.replace("Bitte", "Bitte")  # mantenemos
+    return t
+
+# ───────────────── COMANDOS ─────────────────
+
+def cmd_start(update: Update, context: CallbackContext):
+    update.message.reply_text(
+        "✅ CosplayLive Translate Bot listo.\n\n"
+        "Uso:\n"
+        "1) En el GRUPO del live: /bindchat (una sola vez)\n"
+        "2) En PRIVADO: /setmodel <Nombre>\n"
+        "3) En PRIVADO: /liveon  (activa traducción)\n"
+        "4) En PRIVADO: /liveoff (apaga)\n",
     )
-    await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
 
-async def cmd_whereami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def cmd_bindchat(update: Update, context: CallbackContext):
+    """
+    Se usa EN EL GRUPO del live.
+    Guarda el chat_id del grupo vinculado A LA PERSONA QUE EJECUTA el comando.
+    Lo ideal: que Aurora lo ejecute 1 vez.
+    """
     chat = update.effective_chat
-    await update.message.reply_text(f"Chat ID: <code>{chat.id}</code>", parse_mode=ParseMode.HTML)
-
-async def cmd_setroom(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Solo en privado
-    if update.effective_chat.type != "private":
-        await update.message.reply_text("Usa /setroom en PRIVADO conmigo.")
+    user = update.effective_user
+    if not chat or chat.type not in ("group", "supergroup"):
+        update.message.reply_text("❌ /bindchat se usa en el GRUPO del live (discusión), no en privado.")
         return
 
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("No autorizado.")
-        return
+    rooms = load_rooms()
+    rooms[str(user.id)] = int(chat.id)
+    save_rooms(rooms)
 
-    if not context.args or not context.args[0].lstrip("-").isdigit():
-        await update.message.reply_text("Uso: /setroom <CHAT_ID>\nTip: usa /whereami en el chat del live para obtenerlo.")
-        return
-
-    chat_id = int(context.args[0])
-    session = get_session(user_id) or {"model_name": "Modelo", "enabled": False}
-    session["group_chat_id"] = chat_id
-    set_session(user_id, session)
-
-    await update.message.reply_text(
-        f"✅ Listo. Tu chat del live quedó guardado como:\n<code>{chat_id}</code>",
+    name = get_model_name(user.id)
+    update.message.reply_text(
+        f"✅ Vinculado.\n\n"
+        f"Modelo: <b>{name}</b>\n"
+        f"Grupo ID: <code>{chat.id}</code>\n\n"
+        "Ahora activa traducción con /liveon en PRIVADO conmigo.",
         parse_mode=ParseMode.HTML,
     )
 
-async def cmd_setmodel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
-        await update.message.reply_text("Usa /setmodel en PRIVADO conmigo.")
+def cmd_setmodel(update: Update, context: CallbackContext):
+    """Se usa EN PRIVADO. Guarda nombre por user_id."""
+    chat = update.effective_chat
+    if not chat or chat.type != "private":
+        update.message.reply_text("❌ /setmodel se usa en PRIVADO conmigo.")
         return
-
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("No autorizado.")
-        return
-
     if not context.args:
-        await update.message.reply_text("Uso: /setmodel <Nombre>")
+        update.message.reply_text("Uso: /setmodel Aurora")
         return
 
     name = " ".join(context.args).strip()
-    session = get_session(user_id) or {"enabled": False}
-    session["model_name"] = name
-    set_session(user_id, session)
+    models = load_models()
+    models[str(update.effective_user.id)] = name
+    save_models(models)
 
-    await update.message.reply_text(f"✅ Nombre guardado: <b>{name}</b>", parse_mode=ParseMode.HTML)
+    update.message.reply_text(f"✅ Nombre guardado: {name}")
 
-async def cmd_liveon(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
-        await update.message.reply_text("Usa /liveon en PRIVADO conmigo.")
+def cmd_liveon(update: Update, context: CallbackContext):
+    """Se usa EN PRIVADO. Activa traducción solo para esa modelo."""
+    chat = update.effective_chat
+    if not chat or chat.type != "private":
+        update.message.reply_text("❌ /liveon se usa en PRIVADO conmigo.")
         return
 
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("No autorizado.")
+    uid = update.effective_user.id
+    room = get_room_for_model(uid)
+    if not room:
+        update.message.reply_text(
+            "⚠️ Aún no hay grupo vinculado.\n\n"
+            "Ve al GRUPO del live (discusión) y escribe allí:\n"
+            "/bindchat\n\n"
+            "Luego vuelve aquí y escribe /liveon."
+        )
         return
 
-    session = get_session(user_id) or {}
-    if not session.get("group_chat_id"):
-        await update.message.reply_text("Falta configurar el chat del live. Haz: /setroom <CHAT_ID>")
-        return
+    set_live(uid, True)
+    name = get_model_name(uid)
 
-    session.setdefault("model_name", "Modelo")
-    session["enabled"] = True
-    set_session(user_id, session)
-
-    await update.message.reply_text(
-        "✅ Traducción LIVE activada.\n"
-        "• Lo que escribas aquí (privado) se publicará en el chat del live en alemán.\n"
-        "• Lo que escriban en el chat del live te llegará aquí traducido al portugués."
+    update.message.reply_text(
+        f"🔥 LIVE ON para <b>{name}</b>.\n"
+        "✅ Traducción activada.\n\n"
+        "Ahora:\n"
+        "• Lo que escribas aquí (PT) → lo publico en el grupo (DE)\n"
+        "• Lo que escriban en el grupo (DE) → te lo mando aquí (PT)\n",
+        parse_mode=ParseMode.HTML
     )
 
-async def cmd_liveoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
-        await update.message.reply_text("Usa /liveoff en PRIVADO conmigo.")
+def cmd_liveoff(update: Update, context: CallbackContext):
+    chat = update.effective_chat
+    if not chat or chat.type != "private":
+        update.message.reply_text("❌ /liveoff se usa en PRIVADO conmigo.")
         return
+    uid = update.effective_user.id
+    set_live(uid, False)
+    update.message.reply_text("⛔ LIVE OFF. Traducción desactivada.")
 
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("No autorizado.")
-        return
+def cmd_whereami(update: Update, context: CallbackContext):
+    chat = update.effective_chat
+    update.message.reply_text(f"Chat ID: {chat.id} | type: {chat.type}")
 
-    session = get_session(user_id)
-    if not session:
-        await update.message.reply_text("No hay sesión configurada.")
-        return
+# ───────────────── TRADUCCIÓN ─────────────────
 
-    session["enabled"] = False
-    set_session(user_id, session)
-    await update.message.reply_text("⛔ Traducción LIVE desactivada.")
-
-# ───────────────────────── MESSAGE BRIDGE ─────────────────────────
-
-async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def handle_group_messages(update: Update, context: CallbackContext):
     """
-    Usuario -> (grupo del live) -> bot -> privado modelo (traducido a PT)
+    En el GRUPO:
+    - Si el grupo está vinculado a una modelo
+    - y esa modelo está LIVE ON
+    entonces: traducir DE->PT y mandar a la modelo (privado) con nombre del usuario.
     """
-    if not update.message or not update.effective_chat:
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not msg or not chat or not user:
+        return
+    if user.is_bot:
+        return
+    if chat.type not in ("group", "supergroup"):
         return
 
-    chat_id = update.effective_chat.id
-    if update.effective_user and update.effective_user.is_bot:
+    model_id = find_model_by_room(chat.id)
+    if not model_id:
+        return
+    if not is_live(model_id):
         return
 
-    text = safe_trim(update.message.text or "")
-    if not text:
+    text = msg.text or ""
+    if not text.strip():
         return
 
-    data = load_data()
-    sessions = data.get("sessions", {})
-
-    # Encontrar qué modelo tiene este grupo como room y está enabled
-    target_model_id = None
-    model_session = None
-    for mid, sess in sessions.items():
-        try:
-            if sess.get("enabled") and int(sess.get("group_chat_id", 0)) == int(chat_id):
-                target_model_id = int(mid)
-                model_session = sess
-                break
-        except Exception:
-            continue
-
-    if not target_model_id or not model_session:
+    try:
+        pt = translator_de_to_pt.translate(text)
+    except Exception as e:
+        logger.error(f"Error traduciendo DE->PT: {e}")
         return
 
-    # Formato: "Nombre (user) : [DE original] -> [PT traducido]"
-    sender = user_label(update)
-    original = text
-    translated = translate_text(original, target=TRANSLATE_MODEL_TO)
-
-    msg_to_model = (
-        f"💬 <b>{sender}</b>\n"
-        f"🇩🇪 <i>{original}</i>\n"
-        f"🇵🇹 <b>{translated}</b>"
+    username = f"@{user.username}" if user.username else user.first_name
+    payload = (
+        f"💬 <b>{username}</b>\n"
+        f"🇩🇪 {text}\n"
+        f"🇵🇹 {pt}"
     )
 
     try:
-        await context.bot.send_message(
-            chat_id=target_model_id,
-            text=msg_to_model,
-            parse_mode=ParseMode.HTML,
-        )
+        context.bot.send_message(chat_id=model_id, text=payload, parse_mode=ParseMode.HTML)
     except Exception as e:
-        logger.error(f"No pude enviar mensaje a la modelo (privado): {e}")
+        logger.error(f"Error enviando a modelo en privado: {e}")
 
-async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def handle_model_private(update: Update, context: CallbackContext):
     """
-    Modelo -> (privado) -> bot -> grupo del live (traducido a DE)
+    En PRIVADO:
+    - Solo si el usuario es una modelo que está LIVE ON
+    entonces: traducir PT->DE y publicar en su grupo vinculado.
     """
-    if not update.message or not update.effective_chat:
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not msg or not chat or not user:
+        return
+    if chat.type != "private":
+        return
+    if user.is_bot:
         return
 
-    if update.effective_chat.type != "private":
+    uid = user.id
+    if not is_live(uid):
         return
 
-    user_id = update.effective_user.id
-    if update.effective_user and update.effective_user.is_bot:
+    room = get_room_for_model(uid)
+    if not room:
         return
 
-    text = safe_trim(update.message.text or "")
-    if not text:
+    text = msg.text or ""
+    if not text.strip():
         return
-
-    # ignorar comandos
-    if text.startswith("/"):
-        return
-
-    session = get_session(user_id)
-    if not session or not session.get("enabled"):
-        return
-
-    group_chat_id = session.get("group_chat_id")
-    model_name = session.get("model_name", "Modelo")
-
-    # Traducir a alemán para el público
-    de_text = translate_text(text, target=TRANSLATE_TO)
-
-    out = f"🎙️ <b>{model_name}</b>: {de_text}"
 
     try:
-        await context.bot.send_message(
-            chat_id=int(group_chat_id),
-            text=out,
-            parse_mode=ParseMode.HTML,
-        )
+        de = translator_pt_to_de.translate(text)
+        de = make_german_more_casual(de)
     except Exception as e:
-        logger.error(f"No pude publicar en el chat del live: {e}")
+        logger.error(f"Error traduciendo PT->DE: {e}")
+        return
 
-# ───────────────────────── FLASK KEEP ALIVE ─────────────────────────
+    model_name = get_model_name(uid)
+    out = f"🎙️ <b>{model_name}</b>: {de}"
+
+    try:
+        context.bot.send_message(chat_id=room, text=out, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error(f"Error publicando en grupo: {e}")
+
+# ───────────────── FLASK KEEP ALIVE ─────────────────
 
 flask_app = Flask(__name__)
 
-@flask_app.get("/")
+@flask_app.route("/")
 def index():
-    return "OK - CosplayLive Translator"
+    return "OK - CosplayLive Translate Bot"
 
 def run_flask():
     port = int(os.environ.get("PORT", "10000"))
     flask_app.run(host="0.0.0.0", port=port)
 
-# ───────────────────────── MAIN ─────────────────────────
-
-async def post_init(app):
-    logger.info("Bot iniciado.")
+# ───────────────── MAIN ─────────────────
 
 def main():
-    # Flask en hilo (Render Web Service)
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    # comandos
+    dp.add_handler(CommandHandler("start", cmd_start))
+    dp.add_handler(CommandHandler("whereami", cmd_whereami))
+    dp.add_handler(CommandHandler("bindchat", cmd_bindchat))
+    dp.add_handler(CommandHandler("setmodel", cmd_setmodel))
+    dp.add_handler(CommandHandler("liveon", cmd_liveon))
+    dp.add_handler(CommandHandler("liveoff", cmd_liveoff))
+
+    # mensajes
+    dp.add_handler(MessageHandler(Filters.chat_type.groups & Filters.text & ~Filters.command, handle_group_messages))
+    dp.add_handler(MessageHandler(Filters.chat_type.private & Filters.text & ~Filters.command, handle_model_private))
+
+    # Flask en hilo
     Thread(target=run_flask, daemon=True).start()
 
-    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("whereami", cmd_whereami))
-    app.add_handler(CommandHandler("setroom", cmd_setroom))
-    app.add_handler(CommandHandler("setmodel", cmd_setmodel))
-    app.add_handler(CommandHandler("liveon", cmd_liveon))
-    app.add_handler(CommandHandler("liveoff", cmd_liveoff))
-
-    # puente
-    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, handle_group_message))
-    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, handle_private_message))
-
-    logger.info("CosplayLive Translator corriendo (polling)...")
-    app.run_polling(drop_pending_updates=True)
+    updater.start_polling(drop_pending_updates=True)
+    logger.info("CosplayLive Translate Bot running...")
+    updater.idle()
 
 if __name__ == "__main__":
     main()
