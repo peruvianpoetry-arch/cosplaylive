@@ -1,462 +1,378 @@
 import os
-import threading
-from datetime import datetime
-from collections import defaultdict
+import json
+import logging
+import random
+from threading import Thread
+from typing import Dict, Any, Optional
 
-from flask import Flask, request, jsonify
-
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from flask import Flask
 from deep_translator import GoogleTranslator
 
-# ==========================
-# CONFIGURACIÓN BÁSICA
-# ==========================
+from telegram import Update
+from telegram.constants import ChatType, ParseMode
+from telegram.ext import Updater, CommandHandler, MessageHandler, CallbackContext, filters
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("Falta TELEGRAM_TOKEN en variables de entorno")
+# ───────── LOGGING ─────────
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+)
+logger = logging.getLogger("translator_poster_bot")
 
-# URL base de tu servicio en Render (para construir los links de overlay)
-BASE_URL = os.environ.get("BASE_URL", "https://cosplaylive.onrender.com")
+# ───────── ENV ─────────
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+if not TOKEN:
+    raise RuntimeError("Falta TELEGRAM_TOKEN")
 
-# Flask
-app = Flask(__name__)
+DATA_DIR = os.environ.get("DATA_DIR", "/var/data")
+os.makedirs(DATA_DIR, exist_ok=True)
 
-# Telegram Application (async, PTB v20)
-application = Application.builder().token(TELEGRAM_TOKEN).build()
+ROOMS_FILE = os.path.join(DATA_DIR, "rooms.json")   # model_user_id -> room_chat_id (grupo live)
+MODELS_FILE = os.path.join(DATA_DIR, "models.json") # model_user_id -> model_display_name
+STATE_FILE = os.path.join(DATA_DIR, "state.json")   # last_user per model
 
-# Traductor (a alemán, desde cualquier idioma)
-translator_de = GoogleTranslator(source="auto", target="de")
+# ───────── TRANSLATORS ─────────
+# Usuarios escriben DE (o mezcla) -> modelo recibe PT
+t_de_to_pt = GoogleTranslator(source="auto", target="pt")
+# Modelo escribe PT -> sala recibe DE
+t_pt_to_de = GoogleTranslator(source="auto", target="de")
 
-# ==========================
-# LOG DE CHAT PARA MIRROR / HUD
-# ==========================
+# ───────── MINI GLOSARIO (para evitar cagadas tipo "consolador") ─────────
+# Puedes ampliar esto cuando quieras.
+GLOSSARY_PT_TO_DE = {
+    "consolador": "Toy",
+    "brinquedo": "Toy",
+    "brinquedo sexual": "Toy",
+}
+GLOSSARY_DE_TO_PT = {
+    "Spielzeug": "brinquedo",
+    "Toy": "brinquedo",
+}
 
-CHAT_LOGS = defaultdict(list)
-MAX_LOG_MESSAGES = 200
+def apply_glossary(text: str, mapping: Dict[str, str]) -> str:
+    out = text
+    for k, v in mapping.items():
+        out = out.replace(k, v)
+    return out
 
+# ───────── PLANTILLAS VISTOSAS PARA POSTS ─────────
+POST_TEMPLATES = [
+    "🔥 <b>{model}</b> ist live & in Spiellaune 😈\n\n{msg}\n\n💬 Schreib im Chat…",
+    "💥 <b>{model}</b> ist jetzt online 💥\n\n{msg}\n\n🔥 Wer ist auch da? 👀",
+    "🥵 <b>{model}</b> bringt die Stimmung zum Kochen 🥵\n\n{msg}\n\n💋 Sag hallo!",
+    "✨ <b>{model}</b> ist da… und heute wird’s wild ✨\n\n{msg}\n\n🔥🔥🔥",
+]
 
-def add_chat_log(chat_id: int, user_display: str, text: str, translated: str):
-    """
-    Guarda un mensaje en el log de un chat para mostrarlo en el overlay/HUD.
-    """
-    if not text:
-        return
-    entry = {
-        "time": datetime.utcnow().strftime("%H:%M:%S"),
-        "user": user_display,
-        "text": text,
-        "translated": translated or "",
-    }
-    lst = CHAT_LOGS[chat_id]
-    lst.append(entry)
-    # Limitamos el tamaño del log
-    if len(lst) > MAX_LOG_MESSAGES:
-        CHAT_LOGS[chat_id] = lst[-100:]
+# ───────── JSON HELPERS ─────────
+def load_json(path: str, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except Exception as e:
+        logger.error("Error leyendo %s: %s", path, e)
+        return default
 
+def save_json(path: str, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error("Error guardando %s: %s", path, e)
 
-# ==========================
-# COMANDOS BÁSICOS DEL BOT
-# ==========================
+def rooms() -> Dict[str, int]:
+    return load_json(ROOMS_FILE, {})
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Mensaje de bienvenida: explica traducción + overlays.
-    """
-    await update.effective_message.reply_text(
-        "Hallo! Ich bin der Cosplay Live Helper Bot. 🧋\n\n"
-        "Funktionen:\n"
-        "• Übersetzt Nachrichten automatisch ins Deutsche, damit das Model alles versteht. 🇩🇪\n"
-        "• /overlaylink – gibt dir einen Link zum Spiegel (Mirror) des Chats.\n"
-        "• /overlayhud – gibt dir einen Link zu einem transparenten HUD-Overlay,\n"
-        "  das du als schwebendes Fenster über deiner Kamera verwenden kannst."
+def save_rooms(data: Dict[str, int]):
+    save_json(ROOMS_FILE, data)
+
+def models() -> Dict[str, str]:
+    return load_json(MODELS_FILE, {})
+
+def save_models(data: Dict[str, str]):
+    save_json(MODELS_FILE, data)
+
+def state() -> Dict[str, Any]:
+    return load_json(STATE_FILE, {"last_user": {}})
+
+def save_state(data: Dict[str, Any]):
+    save_json(STATE_FILE, data)
+
+def get_model_name(model_id: int) -> str:
+    m = models().get(str(model_id))
+    return m.strip() if m else "Model"
+
+def get_room_for_model(model_id: int) -> Optional[int]:
+    return rooms().get(str(model_id))
+
+# ───────── COMMANDS ─────────
+def cmd_start(update: Update, context: CallbackContext):
+    update.effective_message.reply_text(
+        "✅ Translator+Poster Bot läuft.\n\n"
+        "Setup (Model im PRIVATCHAT):\n"
+        "1) /setmodel <Name>\n"
+        "2) Geh in den Live-Chat (GRUPPE), schreib irgendwas, dann:\n"
+        "   - Leite diese Nachricht an mich weiter\n"
+        "   - Antworte darauf mit: /setroom\n\n"
+        "Live:\n"
+        "- User schreibt im Live-Chat -> ich sende PT Übersetzung an Model (DM)\n"
+        "- Model schreibt mir (DM) -> ich poste DE Übersetzung in den Live-Chat\n\n"
+        "Posting:\n"
+        "- Model schickt Foto/Video in DM und schreibt danach /post <Text PT>\n"
+        "  oder antwortet auf Media mit /post <Text PT>"
     )
 
+def cmd_setmodel(update: Update, context: CallbackContext):
+    if update.effective_chat.type != ChatType.PRIVATE:
+        update.effective_message.reply_text("❗ Bitte /setmodel im Privat-Chat mit mir.")
+        return
+    if not context.args:
+        update.effective_message.reply_text("Benutzung: /setmodel <Name>")
+        return
+    model_id = update.effective_user.id
+    name = " ".join(context.args).strip()
+    data = models()
+    data[str(model_id)] = name
+    save_models(data)
+    update.effective_message.reply_text(f"✅ Name gespeichert: {name}")
 
-async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Solo informa el ID del usuario (útil para debug).
-    """
-    user = update.effective_user
-    await update.effective_message.reply_text(f"✅ Dein User-ID ist: {user.id}")
-
-
-async def cmd_overlaylink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Devuelve el link del overlay clásico (lista de mensajes) para el chat actual.
-    """
-    chat = update.effective_chat
-    if not chat:
+def cmd_setroom(update: Update, context: CallbackContext):
+    # Debe ser en privado, respondiendo a un mensaje reenviado desde el grupo
+    if update.effective_chat.type != ChatType.PRIVATE:
+        update.effective_message.reply_text("❗ Bitte /setroom im Privat-Chat mit mir.")
         return
 
-    chat_id = chat.id
-    overlay_url = f"{BASE_URL}/overlay?chat_id={chat_id}"
-
-    await update.effective_message.reply_text(
-        "🪞 Spiegel / Mirror dieses Chats:\n"
-        f"{overlay_url}\n\n"
-        "Öffne diesen Link z.B. auf einem zweiten Gerät, um den Chat groß zu sehen."
-    )
-
-
-async def cmd_overlayhud(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Devuelve el link del HUD transparente para el chat actual.
-    Ideal para usarlo en un navegador flotante sobre la pantalla.
-    """
-    chat = update.effective_chat
-    if not chat:
-        return
-
-    chat_id = chat.id
-    hud_url = f"{BASE_URL}/overlayhud?chat_id={chat_id}"
-
-    await update.effective_message.reply_text(
-        "🪞 Transparentes HUD-Overlay für diesen Chat:\n"
-        f"{hud_url}\n\n"
-        "Tipp: Öffne diesen Link in einem schwebenden/Overlay-Browser, "
-        "dann siehst du die Kamera in Telegram und den Chat darüber."
-    )
-
-
-# ==========================
-# TRADUCCIÓN EN EL CHAT
-# ==========================
-
-async def translate_in_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Traduce cada mensaje de texto al alemán y responde con la traducción,
-    además de guardarlo en el log para el overlay/HUD.
-    """
     msg = update.effective_message
-    if not msg:
+    if not msg.reply_to_message or not msg.reply_to_message.forward_from_chat:
+        update.effective_message.reply_text(
+            "So geht's:\n"
+            "1) Geh in den Live-Chat (GRUPPE) und schreib irgendwas.\n"
+            "2) Leite diese Nachricht an mich weiter.\n"
+            "3) Antworte auf die weitergeleitete Nachricht mit /setroom\n"
+        )
+        return
+
+    room = msg.reply_to_message.forward_from_chat
+    model_id = update.effective_user.id
+    data = rooms()
+    data[str(model_id)] = room.id
+    save_rooms(data)
+
+    update.effective_message.reply_text(
+        f"✅ Live-Chat verbunden:\n<b>{room.title}</b>\n(room_id: {room.id})",
+        parse_mode=ParseMode.HTML
+    )
+
+def cmd_post(update: Update, context: CallbackContext):
+    """
+    Model en DM:
+    - envía media (foto/video), luego /post texto
+    - o responde al media con /post texto
+    Se publica en room con texto traducido DE + plantilla vistosa.
+    """
+    if update.effective_chat.type != ChatType.PRIVATE:
+        update.effective_message.reply_text("❗ /post solo en privado conmigo.")
+        return
+
+    model_id = update.effective_user.id
+    room_id = get_room_for_model(model_id)
+    if not room_id:
+        update.effective_message.reply_text("⚠️ Primero configura tu sala con /setroom.")
+        return
+
+    if not context.args:
+        update.effective_message.reply_text("Benutzung: /post <Text (PT)>")
+        return
+
+    # texto que escribe la modelo (PT)
+    raw_pt = " ".join(context.args).strip()
+    # glosario para evitar traducciones raras
+    raw_pt = apply_glossary(raw_pt, GLOSSARY_PT_TO_DE)
+
+    try:
+        translated_de = t_pt_to_de.translate(raw_pt)
+    except Exception as e:
+        logger.error("Error traducción PT->DE: %s", e)
+        translated_de = raw_pt  # fallback
+
+    model_name = get_model_name(model_id)
+    template = random.choice(POST_TEMPLATES)
+    final_text = template.format(model=model_name, msg=translated_de)
+
+    bot = context.bot
+    msg = update.effective_message
+
+    # Detectar media: en el mensaje actual o en reply
+    media_msg = None
+    if msg.photo or msg.video:
+        media_msg = msg
+    elif msg.reply_to_message and (msg.reply_to_message.photo or msg.reply_to_message.video):
+        media_msg = msg.reply_to_message
+
+    try:
+        if media_msg and media_msg.photo:
+            photo = media_msg.photo[-1]
+            bot.send_photo(
+                chat_id=room_id,
+                photo=photo.file_id,
+                caption=final_text,
+                parse_mode=ParseMode.HTML
+            )
+        elif media_msg and media_msg.video:
+            bot.send_video(
+                chat_id=room_id,
+                video=media_msg.video.file_id,
+                caption=final_text,
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            bot.send_message(
+                chat_id=room_id,
+                text=final_text,
+                parse_mode=ParseMode.HTML
+            )
+    except Exception as e:
+        logger.error("Error posteando en sala: %s", e)
+        update.effective_message.reply_text("❌ Error posteando en la sala (revisa permisos del bot).")
+        return
+
+    update.effective_message.reply_text("✅ Posteado en la sala.")
+
+# ───────── LIVE TRANSLATION (ROOM -> MODEL DM) ─────────
+def handle_room_message(update: Update, context: CallbackContext):
+    msg = update.effective_message
+    if not msg or not msg.text:
         return
     if msg.from_user and msg.from_user.is_bot:
         return
 
-    text = msg.text or msg.caption
-    if not text:
-        return
+    room_id = update.effective_chat.id
+    all_rooms = rooms()
 
-    # Nombre amigable del usuario
+    # Encontrar qué modelo tiene este room_id
+    model_id = None
+    for mid, rid in all_rooms.items():
+        if int(rid) == int(room_id):
+            model_id = int(mid)
+            break
+    if not model_id:
+        return  # este grupo no está vinculado
+
     user = msg.from_user
-    if user:
-        if user.username:
-            user_display = f"@{user.username}"
-        else:
-            fullname = (user.first_name or "") + " " + (user.last_name or "" if user.last_name else "")
-            user_display = fullname.strip() or "User"
-    else:
-        user_display = "User"
+    username = f"@{user.username}" if user and user.username else (user.full_name if user else "User")
 
-    translated = ""
+    original = msg.text.strip()
+    # aplicar glosario de DE->PT antes de traducir (por si hay palabras clave)
+    original_for_translate = apply_glossary(original, GLOSSARY_DE_TO_PT)
+
     try:
-        translated = translator_de.translate(text)
+        translated_pt = t_de_to_pt.translate(original_for_translate)
     except Exception as e:
-        print(f"[translate_in_chat] Error traduciendo: {e}")
-        translated = ""
+        logger.error("Error traducción DE->PT: %s", e)
+        translated_pt = original_for_translate
 
-    # Guardar en el log del chat (con o sin traducción)
-    chat = update.effective_chat
-    if chat:
-        add_chat_log(chat.id, user_display, text, translated)
+    # Guardar "último usuario" para respuestas
+    st = state()
+    st.setdefault("last_user", {})
+    st["last_user"][str(model_id)] = {
+        "username": username,
+        "user_id": user.id if user else None,
+        "ts": msg.date.isoformat() if msg.date else "",
+        "room_id": room_id,
+        "original": original,
+    }
+    save_state(st)
 
-    # Si la traducción es vacía o igual al original, no respondemos
-    if not translated:
-        return
-    if translated.strip().lower() == text.strip().lower():
-        return
-
-    await msg.reply_text(f"🌐 {translated}")
-
-
-# ==========================
-# FLASK: RUTAS WEB (OVERLAYS)
-# ==========================
-
-@app.route("/")
-def index():
-    return (
-        "<h1>Cosplay Live Helper Bot</h1>"
-        "<p>Bot de traducción y overlays funcionando.</p>"
-        "<p>Usa /overlaylink o /overlayhud en Telegram para obtener los enlaces.</p>"
+    # Enviar a la modelo en privado
+    payload = (
+        f"👤 <b>{username}</b>\n"
+        f"💬 <b>DE:</b> {original}\n"
+        f"🌍 <b>PT:</b> {translated_pt}"
     )
+    try:
+        context.bot.send_message(chat_id=model_id, text=payload, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error("No pude enviar DM al modelo: %s", e)
 
+# ───────── MODEL DM -> ROOM (PT -> DE) ─────────
+def handle_model_private(update: Update, context: CallbackContext):
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
+    if msg.from_user and msg.from_user.is_bot:
+        return
 
-@app.route("/overlay")
-def overlay():
-    """
-    Página HTML que muestra el mirror del chat (lista completa de mensajes).
-    Se llama con ?chat_id=<id>.
-    """
-    chat_id = request.args.get("chat_id", "").strip()
-    if not chat_id:
-        return (
-            "<h2>Overlay / Mirror</h2>"
-            "<p>Falta el parámetro <code>chat_id</code>.</p>"
-            "<p>Genera el enlace desde Telegram con /overlaylink en el Chat.</p>"
-        )
+    if msg.text.startswith("/"):
+        return  # comandos se manejan aparte
 
-    html = f"""
-<!DOCTYPE html>
-<html lang="de">
-<head>
-<meta charset="UTF-8" />
-<title>Chat Overlay</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<style>
-    body {{
-        margin: 0;
-        padding: 0;
-        background: #000;
-        color: #fff;
-        font-family: system-ui, sans-serif;
-        display: flex;
-        flex-direction: column;
-        height: 100vh;
-    }}
-    header {{
-        padding: 8px 12px;
-        font-size: 14px;
-        background: #111;
-        border-bottom: 1px solid #333;
-    }}
-    #chat {{
-        flex: 1;
-        overflow-y: auto;
-        padding: 8px;
-    }}
-    .msg {{
-        margin-bottom: 8px;
-        padding: 6px 8px;
-        border-radius: 6px;
-        background: #111;
-        border: 1px solid #333;
-        font-size: 14px;
-    }}
-    .meta {{
-        font-size: 11px;
-        color: #aaa;
-        margin-bottom: 3px;
-    }}
-    .original {{
-        font-size: 13px;
-        color: #eee;
-    }}
-    .translated {{
-        font-size: 13px;
-        color: #6cf;
-        margin-top: 3px;
-    }}
-</style>
-</head>
-<body>
-<header>
-    Chat Overlay – Chat ID: {chat_id}
-</header>
-<div id="chat"></div>
+    model_id = update.effective_user.id
+    room_id = get_room_for_model(model_id)
+    if not room_id:
+        update.effective_message.reply_text("⚠️ Primero configura tu sala con /setroom.")
+        return
 
-<script>
-const chatId = "{chat_id}";
-const chatDiv = document.getElementById('chat');
+    model_name = get_model_name(model_id)
 
-async function loadMessages() {{
-    try {{
-        const res = await fetch('/overlay_data?chat_id=' + encodeURIComponent(chatId));
-        if (!res.ok) return;
-        const data = await res.json();
-        const msgs = data.messages || [];
-        chatDiv.innerHTML = '';
-
-        for (const m of msgs) {{
-            const div = document.createElement('div');
-            div.className = 'msg';
-
-            const meta = document.createElement('div');
-            meta.className = 'meta';
-            meta.textContent = `[${{m.time}}] ${{m.user}}`;
-            div.appendChild(meta);
-
-            const orig = document.createElement('div');
-            orig.className = 'original';
-            orig.textContent = m.text || '';
-            div.appendChild(orig);
-
-            if (m.translated && m.translated.trim() !== '') {{
-                const tr = document.createElement('div');
-                tr.className = 'translated';
-                tr.textContent = '🌐 ' + m.translated;
-                div.appendChild(tr);
-            }}
-
-            chatDiv.appendChild(div);
-        }}
-
-        chatDiv.scrollTop = chatDiv.scrollHeight;
-    }} catch (e) {{
-        console.error('Error loading messages', e);
-    }}
-}}
-
-loadMessages();
-setInterval(loadMessages, 2000);
-</script>
-</body>
-</html>
-    """
-    return html
-
-
-@app.route("/overlay_data")
-def overlay_data():
-    """
-    Devuelve los mensajes del chat en JSON para el overlay / HUD.
-    """
-    chat_id = request.args.get("chat_id", "").strip()
-    if not chat_id:
-        return jsonify({"messages": []})
+    raw_pt = msg.text.strip()
+    raw_pt = apply_glossary(raw_pt, GLOSSARY_PT_TO_DE)
 
     try:
-        cid = int(chat_id)
-    except ValueError:
-        return jsonify({"messages": []})
+        translated_de = t_pt_to_de.translate(raw_pt)
+    except Exception as e:
+        logger.error("Error traducción PT->DE: %s", e)
+        translated_de = raw_pt
 
-    msgs = CHAT_LOGS.get(cid, [])
-    return jsonify({"messages": msgs})
+    # Etiquetar al último usuario
+    st = state()
+    last = (st.get("last_user") or {}).get(str(model_id)) or {}
+    tag = last.get("username", "")
 
+    text = f"🌸 <b>{model_name}</b>"
+    if tag:
+        text += f" → <b>{tag}</b>"
+    text += f"\n{translated_de}"
 
-@app.route("/overlayhud")
-def overlay_hud():
-    """
-    HUD transparente para superponer sobre la pantalla.
-    Muestra hasta 3 mensajes recientes, con fondo semitransparente.
-    Ideal para usar en un navegador flotante / Picture-in-Picture.
-    """
-    chat_id = request.args.get("chat_id", "").strip()
-    if not chat_id:
-        return "<h3>Falta chat_id</h3>"
+    try:
+        context.bot.send_message(chat_id=room_id, text=text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error("Error enviando respuesta a sala: %s", e)
+        update.effective_message.reply_text("❌ No pude publicar en la sala (permisos?).")
 
-    html = f"""
-<!DOCTYPE html>
-<html lang="de">
-<head>
-<meta charset="UTF-8" />
-<title>HUD Overlay</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+# ───────── FLASK KEEP ALIVE ─────────
+flask_app = Flask(__name__)
 
-<style>
-    body {{
-        margin: 0;
-        padding: 0;
-        background: rgba(0,0,0,0);
-        font-family: system-ui, sans-serif;
-        overflow: hidden;
-    }}
+@flask_app.route("/")
+def index():
+    return "OK - Translator+Poster Bot"
 
-    #msgs {{
-        position: fixed;
-        bottom: 5%;
-        left: 5%;
-        right: 5%;
-        display: flex;
-        flex-direction: column;
-        gap: 12px;
-        color: #ffffff;
-        font-size: 22px;
-        text-shadow: 0px 0px 5px #000;
-        pointer-events: none; /* para que no interfiera con toques en pantalla */
-    }}
+def run_flask():
+    port = int(os.environ.get("PORT", "10000"))
+    flask_app.run(host="0.0.0.0", port=port)
 
-    .msg {{
-        background: rgba(0,0,0,0.35);
-        padding: 8px 12px;
-        border-radius: 10px;
-        animation: fadein 0.4s ease-out;
-    }}
+# ───────── MAIN ─────────
+def main():
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
 
-    @keyframes fadein {{
-        from {{ opacity: 0; transform: translateY(20px); }}
-        to {{ opacity: 1; transform: translateY(0); }}
-    }}
-</style>
-</head>
+    dp.add_handler(CommandHandler("start", cmd_start))
+    dp.add_handler(CommandHandler("setmodel", cmd_setmodel))
+    dp.add_handler(CommandHandler("setroom", cmd_setroom))
+    dp.add_handler(CommandHandler("post", cmd_post))
 
-<body>
-<div id="msgs"></div>
+    # Grupo live: leer mensajes y traducir a la modelo
+    dp.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND) & (~filters.ChatType.PRIVATE), handle_room_message))
 
-<script>
-const chatId = "{chat_id}";
-const div = document.getElementById("msgs");
+    # Privado modelo: responder (PT->DE) hacia la sala
+    dp.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND) & filters.ChatType.PRIVATE, handle_model_private))
 
-async function loadHUD() {{
-    try {{
-        const res = await fetch("/overlay_data?chat_id=" + encodeURIComponent(chatId));
-        const data = await res.json();
-        const list = data.messages || [];
+    # Flask en hilo
+    t = Thread(target=run_flask, daemon=True)
+    t.start()
 
-        const last = list.slice(-3);  // últimos 3 mensajes
-        div.innerHTML = "";
-
-        last.forEach(m => {{
-            const d = document.createElement("div");
-            d.className = "msg";
-            const translated = m.translated || "";
-            d.innerHTML = `
-                <b>${{m.user}}:</b> ${{m.text}}<br>
-                <span style="color:#6cf;">${{translated}}</span>
-            `;
-            div.appendChild(d);
-        }});
-    }} catch (e) {{
-        console.error("HUD error", e);
-    }}
-}}
-
-setInterval(loadHUD, 1500);
-loadHUD();
-</script>
-
-</body>
-</html>
-    """
-    return html
-
-
-# ==========================
-# REGISTRO DE HANDLERS
-# ==========================
-
-application.add_handler(CommandHandler("start", cmd_start))
-application.add_handler(CommandHandler("whoami", cmd_whoami))
-application.add_handler(CommandHandler("overlaylink", cmd_overlaylink))
-application.add_handler(CommandHandler("overlayhud", cmd_overlayhud))
-
-# Traducción para todos los mensajes de texto en chats donde esté el bot
-application.add_handler(
-    MessageHandler(filters.TEXT & (~filters.COMMAND), translate_in_chat)
-)
-
-
-# ==========================
-# ARRANQUE BOT + FLASK
-# ==========================
-
-def start_bot():
-    # stop_signals=None porque corremos en un hilo secundario (junto a Flask)
-    application.run_polling(drop_pending_updates=True, stop_signals=None)
-
-
-bot_thread = threading.Thread(target=start_bot, name="tg-bot", daemon=True)
-bot_thread.start()
-
+    updater.start_polling(drop_pending_updates=True)
+    logger.info("Translator+Poster Bot läuft…")
+    updater.idle()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    main()
