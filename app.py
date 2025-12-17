@@ -1,68 +1,40 @@
 import os
 import logging
-from flask import Flask
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder,
-    ContextTypes,
-    MessageHandler,
+    Application,
     CommandHandler,
+    MessageHandler,
+    ContextTypes,
     filters,
 )
 
-# ======================
-# CONFIG
-# ======================
-
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Falta TELEGRAM_BOT_TOKEN en Render (Environment)")
-
-PORT = int(os.environ.get("PORT", 10000))
-
-# ======================
-# LOGGING
-# ======================
+# ───── CONFIG ─────
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
 
-# ======================
-# FLASK (keep alive)
-# ======================
-
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "CosplayLive bot running"
-
-# ======================
-# TELEGRAM HANDLERS
-# ======================
-
+# ───── HANDLERS ─────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot activo ✅")
+    await update.message.reply_text("✅ Bot funcionando correctamente")
 
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(update.message.text)
 
-# ======================
-# MAIN
-# ======================
-
+# ───── MAIN ─────
 def main():
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    if not TOKEN:
+        raise RuntimeError("❌ TELEGRAM_BOT_TOKEN no definido")
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+    app = Application.builder().token(TOKEN).build()
 
-    logger.info("Bot iniciado correctamente")
-    application.run_polling()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
