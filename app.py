@@ -1,435 +1,454 @@
+import os
 import json
 import logging
-import os
-from threading import Thread
-from typing import Dict, Optional
+import time
+from datetime import datetime
+from typing import Dict, Any, Optional, List
 
 from flask import Flask
-from telegram import Update, ParseMode
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 
-from deep_translator import GoogleTranslator
-
-# ───────────────── CONFIG ─────────────────
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+from telegram import Update
+from telegram.ext import (
+    Updater,
+    CommandHandler,
+    MessageHandler,
+    Filters,
+    CallbackContext,
 )
-logger = logging.getLogger("cosplaylive_translate")
 
-TOKEN = os.environ.get("TELEGRAM_TOKEN") or os.environ.get("TELEGRAM_ANNOUNCE")
+try:
+    from deep_translator import GoogleTranslator
+except Exception:
+    GoogleTranslator = None
+
+# ─────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────
+
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN") or ""
 if not TOKEN:
-    raise RuntimeError("Falta TELEGRAM_TOKEN (o TELEGRAM_ANNOUNCE) en Render")
+    raise RuntimeError("Falta TELEGRAM_BOT_TOKEN (o TELEGRAM_TOKEN) en Render → Environment.")
 
 DATA_DIR = os.environ.get("DATA_DIR", "/var/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# Admin (TU ID). Puedes poner varios separados por coma: "123,456"
-ADMIN_IDS = set()
-_admin_raw = os.environ.get("ADMIN_IDS", "").strip()
-if _admin_raw:
+ROOMS_FILE = os.path.join(DATA_DIR, "rooms.json")      # model_user_id -> group_chat_id
+MODELS_FILE = os.path.join(DATA_DIR, "models.json")    # model_user_id -> model_name
+LIVE_FILE = os.path.join(DATA_DIR, "live.json")        # model_user_id -> true/false
+STREAMER_FILE = os.path.join(DATA_DIR, "streamer.json")# owner_user_id -> model_user_id
+PROMOS_FILE = os.path.join(DATA_DIR, "promos.json")    # model_user_id -> list of queued items
+
+PROMO_INTERVAL_SECONDS = int(os.environ.get("PROMO_INTERVAL_SECONDS", str(2 * 60 * 60)))  # 2h default
+
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+)
+logger = logging.getLogger("cosplaylive")
+
+# ─────────────────────────────────────────────────────────────
+# UTILS: JSON STORE
+# ─────────────────────────────────────────────────────────────
+
+def _load_json(path: str, default: Any) -> Any:
     try:
-        ADMIN_IDS = {int(x.strip()) for x in _admin_raw.split(",") if x.strip().isdigit()}
-    except Exception:
-        ADMIN_IDS = set()
-
-ROOMS_FILE = os.path.join(DATA_DIR, "rooms.json")        # streamer_user_id -> group_chat_id
-LIVE_FILE = os.path.join(DATA_DIR, "live.json")          # streamer_user_id -> true/false
-STREAMER_FILE = os.path.join(DATA_DIR, "streamer.json")  # {"streamer_user_id": 123, "streamer_username": "@xxx"}
-USERS_FILE = os.path.join(DATA_DIR, "users.json")        # "@username" -> user_id (cache)
-
-# Traducción
-translator_de_to_pt = GoogleTranslator(source="de", target="pt")
-translator_pt_to_de = GoogleTranslator(source="pt", target="de")
-
-# ───────────────── JSON helpers ─────────────────
-
-def load_json(path: str, default):
-    try:
+        if not os.path.exists(path):
+            return default
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except FileNotFoundError:
-        return default
     except Exception as e:
-        logger.error(f"Error cargando {path}: {e}")
+        logger.exception("Error leyendo %s: %s", path, e)
         return default
 
-def save_json(path: str, data):
+def _save_json(path: str, data: Any) -> None:
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
     except Exception as e:
-        logger.error(f"Error guardando {path}: {e}")
+        logger.exception("Error guardando %s: %s", path, e)
 
-def load_rooms() -> Dict[str, int]:
-    return load_json(ROOMS_FILE, {})
+def _now() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-def save_rooms(d: Dict[str, int]):
-    save_json(ROOMS_FILE, d)
+# ─────────────────────────────────────────────────────────────
+# TRANSLATION
+# ─────────────────────────────────────────────────────────────
 
-def load_live() -> Dict[str, bool]:
-    return load_json(LIVE_FILE, {})
+def translate(text: str, source: str, target: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if GoogleTranslator is None:
+        return text  # fallback
+    try:
+        return GoogleTranslator(source=source, target=target).translate(text)
+    except Exception:
+        return text
 
-def save_live(d: Dict[str, bool]):
-    save_json(LIVE_FILE, d)
+def hot_caption_fallback() -> str:
+    # “Hot” pero sin explicitar porno duro (para evitar bloqueos y para que sea usable en anuncios)
+    pool = [
+        "🔥 Nur für dich… heute ganz nah.",
+        "😈 Lust auf etwas Besonderes? Komm rein.",
+        "💋 Ein kleiner Vorgeschmack…",
+        "✨ Heute wird es heißer als normal.",
+        "👀 Du willst mehr sehen? Bleib dran.",
+    ]
+    return pool[int(time.time()) % len(pool)]
 
-def load_streamer():
-    return load_json(STREAMER_FILE, {"streamer_user_id": None, "streamer_username": None})
+# ─────────────────────────────────────────────────────────────
+# CORE STATE
+# ─────────────────────────────────────────────────────────────
 
-def save_streamer(streamer_user_id: int, streamer_username: Optional[str]):
-    save_json(STREAMER_FILE, {"streamer_user_id": streamer_user_id, "streamer_username": streamer_username})
-
-def load_users() -> Dict[str, int]:
-    return load_json(USERS_FILE, {})
-
-def save_users(d: Dict[str, int]):
-    save_json(USERS_FILE, d)
-
-def is_admin(user_id: int) -> bool:
-    # Si ADMIN_IDS está vacío, permitimos que el primer admin se “auto-reclame” con /claimadmin
-    return (user_id in ADMIN_IDS)
-
-def get_streamer_id() -> Optional[int]:
-    s = load_streamer()
-    sid = s.get("streamer_user_id")
+def get_streamer_for_owner(owner_id: int) -> Optional[int]:
+    m = _load_json(STREAMER_FILE, {})
+    sid = m.get(str(owner_id))
     return int(sid) if sid else None
 
-def is_live(streamer_user_id: int) -> bool:
-    live = load_live()
-    return bool(live.get(str(streamer_user_id), False))
+def set_streamer_for_owner(owner_id: int, streamer_id: int) -> None:
+    m = _load_json(STREAMER_FILE, {})
+    m[str(owner_id)] = int(streamer_id)
+    _save_json(STREAMER_FILE, m)
 
-def set_live(streamer_user_id: int, on: bool):
-    live = load_live()
-    live[str(streamer_user_id)] = on
-    save_live(live)
+def get_group_for_streamer(streamer_id: int) -> Optional[int]:
+    rooms = _load_json(ROOMS_FILE, {})
+    gid = rooms.get(str(streamer_id))
+    return int(gid) if gid else None
 
-def get_room_for_streamer(streamer_user_id: int) -> Optional[int]:
-    rooms = load_rooms()
-    cid = rooms.get(str(streamer_user_id))
-    return int(cid) if cid else None
+def set_group_for_streamer(streamer_id: int, group_chat_id: int) -> None:
+    rooms = _load_json(ROOMS_FILE, {})
+    rooms[str(streamer_id)] = int(group_chat_id)
+    _save_json(ROOMS_FILE, rooms)
 
-# ───────────────── Util: hacer alemán menos formal ─────────────────
+def set_model_name(streamer_id: int, name: str) -> None:
+    models = _load_json(MODELS_FILE, {})
+    models[str(streamer_id)] = name.strip()[:40]
+    _save_json(MODELS_FILE, models)
 
-def make_german_more_casual(text: str) -> str:
-    t = text
-    # ajustes muy suaves (sin romper frases)
-    t = t.replace("Sie ", "du ").replace(" Ihnen", " dir").replace(" Ihr ", " dein ")
-    return t
+def get_model_name(streamer_id: int) -> str:
+    models = _load_json(MODELS_FILE, {})
+    return models.get(str(streamer_id), "Model")
 
-# ───────────────── Registro de usuarios (para /setstreamer @user) ─────────────────
+def set_live(streamer_id: int, on: bool) -> None:
+    live = _load_json(LIVE_FILE, {})
+    live[str(streamer_id)] = bool(on)
+    _save_json(LIVE_FILE, live)
 
-def cache_user(update: Update):
+def is_live(streamer_id: int) -> bool:
+    live = _load_json(LIVE_FILE, {})
+    return bool(live.get(str(streamer_id), False))
+
+# ─────────────────────────────────────────────────────────────
+# PROMOS QUEUE
+# ─────────────────────────────────────────────────────────────
+
+def promos_load() -> Dict[str, List[Dict[str, Any]]]:
+    return _load_json(PROMOS_FILE, {})
+
+def promos_save(d: Dict[str, List[Dict[str, Any]]]) -> None:
+    _save_json(PROMOS_FILE, d)
+
+def enqueue_promo(streamer_id: int, item: Dict[str, Any]) -> None:
+    d = promos_load()
+    key = str(streamer_id)
+    d.setdefault(key, [])
+    d[key].append(item)
+    promos_save(d)
+
+def pop_next_promo(streamer_id: int) -> Optional[Dict[str, Any]]:
+    d = promos_load()
+    key = str(streamer_id)
+    q = d.get(key, [])
+    if not q:
+        return None
+    item = q.pop(0)
+    d[key] = q
+    promos_save(d)
+    return item
+
+def queue_size(streamer_id: int) -> int:
+    d = promos_load()
+    return len(d.get(str(streamer_id), []))
+
+# ─────────────────────────────────────────────────────────────
+# COMMANDS
+# ─────────────────────────────────────────────────────────────
+
+def cmd_start(update: Update, context: CallbackContext) -> None:
     user = update.effective_user
-    if not user:
-        return
-    if user.username:
-        users = load_users()
-        users[f"@{user.username.lower()}"] = int(user.id)
-        save_users(users)
+    update.message.reply_text("✅ Bot funcionando correctamente")
 
-# ───────────────── COMANDOS ─────────────────
-
-def cmd_start(update: Update, context: CallbackContext):
-    cache_user(update)
-    update.message.reply_text(
-        "✅ CosplayLive Translate listo.\n\n"
-        "ADMIN:\n"
-        "• /setstreamer @username  (elige streamer)\n"
-        "• /whoami  (ver tu ID)\n\n"
-        "STREAMER (Aurora):\n"
-        "• En el grupo: /bindchat (una vez)\n"
-        "• En privado: /liveon /liveoff\n\n"
-        "Traducción:\n"
-        "• Grupo (DE) -> Streamer (PT) en privado\n"
-        "• Streamer (PT) -> Grupo (DE)\n"
-    )
-
-def cmd_whoami(update: Update, context: CallbackContext):
-    cache_user(update)
+def cmd_whoami(update: Update, context: CallbackContext) -> None:
     u = update.effective_user
-    update.message.reply_text(f"ID: {u.id}\nUser: @{u.username}" if u.username else f"ID: {u.id}")
+    update.message.reply_text(f"Tu user_id: {u.id}\nUsername: @{u.username if u.username else '(sin username)'}")
 
-def cmd_claimadmin(update: Update, context: CallbackContext):
-    # Solo si no hay ADMIN_IDS configurado (modo emergencia)
-    global ADMIN_IDS
-    if ADMIN_IDS:
-        update.message.reply_text("ADMIN_IDS ya está configurado en Render. No necesitas /claimadmin.")
-        return
-    ADMIN_IDS.add(update.effective_user.id)
-    update.message.reply_text("✅ Listo. Tu cuenta quedó como admin temporal (solo en memoria). "
-                              "RECOMENDADO: pon tu ID en ADMIN_IDS en Render para que sea permanente.")
-
-def cmd_setstreamer(update: Update, context: CallbackContext):
-    """
-    ADMIN: /setstreamer @aurorab23
-    ADMIN: /setstreamer 123456789
-    ADMIN: /setstreamer (respondiendo a un mensaje reenviado del streamer si trae forward info)
-    """
-    cache_user(update)
-    uid = update.effective_user.id
-    chat = update.effective_chat
-    msg = update.effective_message
-
-    if chat.type != "private":
-        msg.reply_text("❌ /setstreamer se usa en PRIVADO conmigo.")
-        return
-    if not is_admin(uid):
-        msg.reply_text("❌ No autorizado (admin).")
+def cmd_bindchat(update: Update, context: CallbackContext) -> None:
+    # Se usa EN EL GRUPO. Vincula ese grupo al streamer asignado a quien ejecuta el comando (owner).
+    if update.effective_chat.type not in ("group", "supergroup"):
+        update.message.reply_text("Usa /bindchat dentro del grupo.")
         return
 
-    # Caso 1: por argumento @username o ID
-    if context.args:
-        arg = context.args[0].strip()
-        # @username
-        if arg.startswith("@"):
-            users = load_users()
-            key = arg.lower()
-            sid = users.get(key)
-            if not sid:
-                msg.reply_text(
-                    "⚠️ No tengo registrado ese @username aún.\n\n"
-                    "Solución rápida:\n"
-                    "1) Pídele a Aurora que le escriba 'hola' al bot (en privado).\n"
-                    "2) Luego intenta otra vez: /setstreamer @Aurorab23"
-                )
+    owner_id = update.effective_user.id
+    streamer_id = get_streamer_for_owner(owner_id)
+    if not streamer_id:
+        update.message.reply_text(
+            "❌ No hay streamer seleccionado.\n"
+            "Primero haz esto en privado conmigo:\n"
+            "1) Reenvíame (forward) un mensaje de Aurora\n"
+            "o 2) /setstreamer @username"
+        )
+        return
+
+    set_group_for_streamer(streamer_id, update.effective_chat.id)
+    name = get_model_name(streamer_id)
+    update.message.reply_text(f"✅ Grupo vinculado a streamer: {name} (id {streamer_id})")
+
+def cmd_setstreamer(update: Update, context: CallbackContext) -> None:
+    # Se usa EN PRIVADO por el owner/admin.
+    # Opción A: /setstreamer @Aurorab23
+    # Opción B: responder a un mensaje reenviado de Aurora
+    if update.effective_chat.type != "private":
+        update.message.reply_text("Usa /setstreamer en privado conmigo.")
+        return
+
+    owner_id = update.effective_user.id
+
+    # Si es reply a un forward
+    if update.message.reply_to_message and update.message.reply_to_message.forward_from:
+        streamer_id = update.message.reply_to_message.forward_from.id
+        set_streamer_for_owner(owner_id, streamer_id)
+        update.message.reply_text(f"✅ Streamer seleccionado por forward: user_id {streamer_id}")
+        return
+
+    # Si viene con @username
+    if context.args and len(context.args) >= 1:
+        raw = context.args[0].strip()
+        if raw.startswith("@"):
+            try:
+                chat = context.bot.get_chat(raw)
+                streamer_id = chat.id
+                set_streamer_for_owner(owner_id, streamer_id)
+                update.message.reply_text(f"✅ Streamer seleccionado: {raw} (id {streamer_id})")
                 return
-            save_streamer(int(sid), arg)
-            msg.reply_text(f"✅ Streamer configurada: {arg} (ID {sid})")
-            return
+            except Exception:
+                update.message.reply_text("❌ No pude resolver ese @username. Usa la opción forward.")
+                return
 
-        # ID numérico
-        if arg.isdigit():
-            save_streamer(int(arg), None)
-            msg.reply_text(f"✅ Streamer configurada por ID: {arg}")
-            return
-
-    # Caso 2: por reply a un forward (si viene)
-    if msg.reply_to_message:
-        # forward_from (usuario)
-        fwd_user = msg.reply_to_message.forward_from
-        if fwd_user and fwd_user.id:
-            sname = f"@{fwd_user.username}" if fwd_user.username else None
-            save_streamer(int(fwd_user.id), sname)
-            msg.reply_text(f"✅ Streamer configurada desde forward: {sname or fwd_user.id}")
-            return
-
-    msg.reply_text(
-        "Uso:\n"
-        "• /setstreamer @Aurorab23\n"
-        "• /setstreamer 123456789\n\n"
-        "Si el @ no funciona:\n"
-        "1) Aurora debe escribirle al bot en privado (un 'hola').\n"
-        "2) Luego repites /setstreamer @Aurorab23"
+    update.message.reply_text(
+        "✅ Para seleccionar streamer:\n"
+        "• Opción fácil: Reenvíame (forward) cualquier mensaje de Aurora y listo.\n"
+        "• Opción @: /setstreamer @Aurorab23\n"
+        "Tip: también puedes hacer /setstreamer respondiendo a un mensaje reenviado."
     )
 
-def cmd_bindchat(update: Update, context: CallbackContext):
-    """
-    STREAMER: se usa EN EL GRUPO del live.
-    Vincula ese grupo al streamer configurado.
-    """
-    cache_user(update)
-    chat = update.effective_chat
-    msg = update.effective_message
-
-    if chat.type not in ("group", "supergroup"):
-        msg.reply_text("❌ /bindchat se usa en el GRUPO (chat), no en privado.")
+def cmd_setmodel(update: Update, context: CallbackContext) -> None:
+    # Solo streamer puede poner su nombre.
+    if update.effective_chat.type != "private":
+        update.message.reply_text("Usa /setmodel en privado conmigo.")
         return
-
-    streamer_id = get_streamer_id()
-    if not streamer_id:
-        msg.reply_text("⚠️ Aún no hay streamer configurada. El admin debe hacer /setstreamer primero.")
+    uid = update.effective_user.id
+    if not context.args:
+        update.message.reply_text("Uso: /setmodel Aurora")
         return
+    name = " ".join(context.args).strip()
+    set_model_name(uid, name)
+    update.message.reply_text(f"✅ Nombre de modelo guardado: {name}")
 
-    # Solo streamer o admin puede bindear
-    caller_id = update.effective_user.id
-    if caller_id != streamer_id and not is_admin(caller_id):
-        msg.reply_text("❌ Solo la streamer o el admin puede usar /bindchat aquí.")
+def cmd_liveon(update: Update, context: CallbackContext) -> None:
+    if update.effective_chat.type != "private":
+        update.message.reply_text("Usa /liveon en privado conmigo (solo streamer).")
         return
-
-    rooms = load_rooms()
-    rooms[str(streamer_id)] = int(chat.id)
-    save_rooms(rooms)
-
-    msg.reply_text(
-        f"✅ Grupo vinculado al streamer.\n"
-        f"Chat ID: {chat.id}\n\n"
-        "Ahora la streamer puede activar traducción con /liveon en privado."
-    )
-
-def cmd_liveon(update: Update, context: CallbackContext):
-    cache_user(update)
-    chat = update.effective_chat
-    msg = update.effective_message
-
-    if chat.type != "private":
-        msg.reply_text("❌ /liveon se usa en PRIVADO conmigo.")
-        return
-
-    streamer_id = get_streamer_id()
-    if not streamer_id:
-        msg.reply_text("⚠️ No hay streamer configurada. Admin debe hacer /setstreamer primero.")
-        return
-
-    if update.effective_user.id != streamer_id:
-        msg.reply_text("❌ Solo la streamer configurada puede usar /liveon.")
-        return
-
-    room = get_room_for_streamer(streamer_id)
-    if not room:
-        msg.reply_text("⚠️ Falta vincular el grupo: entra al grupo y usa /bindchat.")
-        return
-
+    streamer_id = update.effective_user.id
     set_live(streamer_id, True)
-    msg.reply_text(
-        "🔥 LIVE ON.\n"
-        "✅ Traducción activada.\n\n"
-        "• Tú (PT) -> Grupo (DE)\n"
-        "• Grupo (DE) -> Tú (PT) en privado"
-    )
+    update.message.reply_text("✅ LIVE ON")
 
-def cmd_liveoff(update: Update, context: CallbackContext):
-    cache_user(update)
-    chat = update.effective_chat
-    msg = update.effective_message
-
-    if chat.type != "private":
-        msg.reply_text("❌ /liveoff se usa en PRIVADO conmigo.")
+def cmd_liveoff(update: Update, context: CallbackContext) -> None:
+    if update.effective_chat.type != "private":
+        update.message.reply_text("Usa /liveoff en privado conmigo (solo streamer).")
         return
-
-    streamer_id = get_streamer_id()
-    if not streamer_id:
-        msg.reply_text("⚠️ No hay streamer configurada.")
-        return
-
-    if update.effective_user.id != streamer_id and not is_admin(update.effective_user.id):
-        msg.reply_text("❌ Solo streamer o admin.")
-        return
-
+    streamer_id = update.effective_user.id
     set_live(streamer_id, False)
-    msg.reply_text("⛔ LIVE OFF. Traducción desactivada.")
+    update.message.reply_text("⛔ LIVE OFF")
 
-# ───────────────── TRADUCCIÓN ─────────────────
+def cmd_queue(update: Update, context: CallbackContext) -> None:
+    if update.effective_chat.type != "private":
+        update.message.reply_text("Usa /queue en privado conmigo.")
+        return
+    streamer_id = update.effective_user.id
+    update.message.reply_text(f"📦 Promos en cola: {queue_size(streamer_id)}")
 
-def handle_group_messages(update: Update, context: CallbackContext):
-    cache_user(update)
-    msg = update.effective_message
+# ─────────────────────────────────────────────────────────────
+# MESSAGE HANDLERS (TRANSLATION + PROMOS)
+# ─────────────────────────────────────────────────────────────
+
+def handle_group_text(update: Update, context: CallbackContext) -> None:
+    # Mensajes en grupo → se traducen DE->PT y se envían al streamer si está LIVE ON
     chat = update.effective_chat
-    user = update.effective_user
-
-    if not msg or not chat or not user:
-        return
-    if user.is_bot:
-        return
     if chat.type not in ("group", "supergroup"):
         return
 
-    streamer_id = get_streamer_id()
-    if not streamer_id:
-        return
-    if not is_live(streamer_id):
-        return
-
-    room = get_room_for_streamer(streamer_id)
-    if not room or int(room) != int(chat.id):
-        return
-
-    text = msg.text or ""
-    if not text.strip():
-        return
-
-    try:
-        pt = translator_de_to_pt.translate(text)
-    except Exception as e:
-        logger.error(f"DE->PT error: {e}")
-        return
-
-    username = f"@{user.username}" if user.username else (user.first_name or "User")
-    payload = f"💬 <b>{username}</b>\n🇩🇪 {text}\n🇵🇹 {pt}"
-
-    try:
-        context.bot.send_message(chat_id=streamer_id, text=payload, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        logger.error(f"Send to streamer error: {e}")
-
-def handle_streamer_private(update: Update, context: CallbackContext):
-    cache_user(update)
     msg = update.effective_message
-    chat = update.effective_chat
-    user = update.effective_user
-
-    if not msg or not chat or not user:
-        return
-    if chat.type != "private":
-        return
-    if user.is_bot:
+    txt = (msg.text or "").strip()
+    if not txt:
         return
 
-    streamer_id = get_streamer_id()
+    # Encontrar streamer por chat_id
+    rooms = _load_json(ROOMS_FILE, {})
+    streamer_id = None
+    for k, v in rooms.items():
+        if int(v) == int(chat.id):
+            streamer_id = int(k)
+            break
     if not streamer_id:
         return
-    if user.id != streamer_id:
-        return
+
     if not is_live(streamer_id):
         return
 
-    room = get_room_for_streamer(streamer_id)
-    if not room:
-        return
+    user = update.effective_user
+    sender = user.first_name or "User"
+    de_to_pt = translate(txt, source="de", target="pt")
+    model_name = get_model_name(streamer_id)
 
-    text = msg.text or ""
-    if not text.strip():
-        return
-
+    payload = f"💬 <b>{sender}</b> (DE→PT):\n{de_to_pt}"
     try:
-        de = translator_pt_to_de.translate(text)
-        de = make_german_more_casual(de)
+        context.bot.send_message(chat_id=streamer_id, text=payload, parse_mode="HTML")
     except Exception as e:
-        logger.error(f"PT->DE error: {e}")
+        logger.warning("No pude enviar al streamer: %s", e)
+
+def handle_streamer_private(update: Update, context: CallbackContext) -> None:
+    # Mensajes privados del streamer → se traducen PT->DE y se publican al grupo vinculado
+    if update.effective_chat.type != "private":
         return
 
-    out = f"🎙️ <b>Aurora</b>: {de}"
-    try:
-        context.bot.send_message(chat_id=room, text=out, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        logger.error(f"Publish to group error: {e}")
+    streamer_id = update.effective_user.id
+    msg = update.effective_message
 
-# ───────────────── FLASK KEEP ALIVE ─────────────────
+    # 1) Si envía TEXTO normal
+    if msg.text and not msg.text.startswith("/"):
+        room = get_group_for_streamer(streamer_id)
+        if not room:
+            msg.reply_text("❌ No hay grupo vinculado. Pídele al admin que haga /bindchat en el grupo.")
+            return
+
+        out = translate(msg.text, source="pt", target="de")
+        model_name = get_model_name(streamer_id)
+        payload = f"🔥 <b>{model_name}</b>:\n{out}"
+        try:
+            context.bot.send_message(chat_id=room, text=payload, parse_mode="HTML")
+        except Exception as e:
+            logger.warning("No pude publicar al grupo: %s", e)
+        return
+
+    # 2) Si envía FOTO/VIDEO como promo → ENCOLAR
+    if msg.photo or msg.video:
+        caption = (msg.caption or "").strip()
+        if not caption:
+            caption_de = hot_caption_fallback()
+        else:
+            caption_de = translate(caption, source="pt", target="de")
+
+        item = {
+            "ts": _now(),
+            "type": "photo" if msg.photo else "video",
+            "file_id": (msg.photo[-1].file_id if msg.photo else msg.video.file_id),
+            "caption_de": caption_de,
+        }
+        enqueue_promo(streamer_id, item)
+        msg.reply_text(f"✅ Promo guardada en cola. Total ahora: {queue_size(streamer_id)}")
+        return
+
+def handle_forward_to_select_streamer(update: Update, context: CallbackContext) -> None:
+    # Si el owner/admin reenvía un mensaje de Aurora al bot (en privado),
+    # el bot la selecciona como streamer automáticamente.
+    if update.effective_chat.type != "private":
+        return
+    msg = update.effective_message
+    if msg.forward_from:
+        owner_id = update.effective_user.id
+        streamer_id = msg.forward_from.id
+        set_streamer_for_owner(owner_id, streamer_id)
+        update.effective_message.reply_text(f"✅ Streamer seleccionado por forward: user_id {streamer_id}")
+
+# ─────────────────────────────────────────────────────────────
+# PROMO JOB
+# ─────────────────────────────────────────────────────────────
+
+def promo_tick(context: CallbackContext) -> None:
+    # Recorre streamers LIVE ON y si hay promo en cola, publica una
+    try:
+        live = _load_json(LIVE_FILE, {})
+        rooms = _load_json(ROOMS_FILE, {})
+        for sid_str, on in live.items():
+            if not on:
+                continue
+            streamer_id = int(sid_str)
+            room = rooms.get(sid_str)
+            if not room:
+                continue
+
+            item = pop_next_promo(streamer_id)
+            if not item:
+                continue
+
+            model_name = get_model_name(streamer_id)
+            cap = item.get("caption_de", "") or hot_caption_fallback()
+            caption = f"🔥 <b>{model_name}</b>\n{cap}"
+
+            if item["type"] == "photo":
+                context.bot.send_photo(chat_id=int(room), photo=item["file_id"], caption=caption, parse_mode="HTML")
+            else:
+                context.bot.send_video(chat_id=int(room), video=item["file_id"], caption=caption, parse_mode="HTML")
+
+    except Exception as e:
+        logger.exception("promo_tick error: %s", e)
+
+# ─────────────────────────────────────────────────────────────
+# FLASK keep-alive for Render
+# ─────────────────────────────────────────────────────────────
 
 flask_app = Flask(__name__)
 
-@flask_app.route("/")
-def index():
-    return "OK - CosplayLive Translate"
+@flask_app.get("/")
+def home():
+    return "OK"
 
-def run_flask():
-    port = int(os.environ.get("PORT", "10000"))
-    flask_app.run(host="0.0.0.0", port=port)
-
-# ───────────────── MAIN ─────────────────
-
-def main():
-    updater = Updater(TOKEN, use_context=True)
+def main() -> None:
+    updater = Updater(token=TOKEN, use_context=True)
     dp = updater.dispatcher
 
-    # comandos
     dp.add_handler(CommandHandler("start", cmd_start))
     dp.add_handler(CommandHandler("whoami", cmd_whoami))
-    dp.add_handler(CommandHandler("claimadmin", cmd_claimadmin))
     dp.add_handler(CommandHandler("setstreamer", cmd_setstreamer))
+    dp.add_handler(CommandHandler("setmodel", cmd_setmodel))
     dp.add_handler(CommandHandler("bindchat", cmd_bindchat))
     dp.add_handler(CommandHandler("liveon", cmd_liveon))
     dp.add_handler(CommandHandler("liveoff", cmd_liveoff))
+    dp.add_handler(CommandHandler("queue", cmd_queue))
 
-    # mensajes
-    dp.add_handler(MessageHandler(Filters.chat_type.groups & Filters.text & ~Filters.command, handle_group_messages))
-    dp.add_handler(MessageHandler(Filters.chat_type.private & Filters.text & ~Filters.command, handle_streamer_private))
+    # Forward-based streamer selection (auto)
+    dp.add_handler(MessageHandler(Filters.forwarded & Filters.chat_type.private, handle_forward_to_select_streamer))
 
-    # Flask en hilo
-    Thread(target=run_flask, daemon=True).start()
+    # Group -> Streamer translation
+    dp.add_handler(MessageHandler(Filters.chat_type.groups & Filters.text & ~Filters.command, handle_group_text))
 
+    # Streamer private -> Group + Promo queue
+    dp.add_handler(MessageHandler(Filters.chat_type.private & (Filters.text | Filters.photo | Filters.video), handle_streamer_private))
+
+    # Job: promos
+    updater.job_queue.run_repeating(promo_tick, interval=PROMO_INTERVAL_SECONDS, first=30)
+
+    # Start bot
     updater.start_polling(drop_pending_updates=True)
-    logger.info("CosplayLive Translate running...")
+
+    # Start Flask (Render expects a web listener)
+    port = int(os.environ.get("PORT", "10000"))
+    logger.info("Flask on port %s", port)
+    flask_app.run(host="0.0.0.0", port=port)
+
     updater.idle()
 
 if __name__ == "__main__":
