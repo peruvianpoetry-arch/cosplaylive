@@ -1,336 +1,451 @@
 import os
 import json
 import time
-import logging
+import threading
 from pathlib import Path
 from typing import Dict, Any, Optional
 
 from flask import Flask
 
-from telegram import Update
+from telegram import Update, Message
+from telegram.constants import ChatType
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 
-# =========================
-# CONFIG / LOGGING
-# =========================
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-)
-logger = logging.getLogger("cosplaylive")
+# Optional translator (deep-translator)
+try:
+    from deep_translator import GoogleTranslator
+except Exception:
+    GoogleTranslator = None
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
-if not TOKEN:
-    raise RuntimeError("Falta TELEGRAM_BOT_TOKEN (o TELEGRAM_TOKEN) en Environment Variables")
 
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/var/data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+# -----------------------------
+# CONFIG
+# -----------------------------
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("Falta TELEGRAM_BOT_TOKEN en Environment Variables")
 
-STATE_FILE = DATA_DIR / "state.json"
+DATA_DIR = os.getenv("DATA_DIR", "/var/data")
+Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
 
-DEFAULT_GROUP_LANG = os.environ.get("GROUP_LANGUAGE", "de")   # idioma del grupo (lo que escriben usuarios)
-DEFAULT_MODEL_LANG = os.environ.get("MODEL_LANGUAGE", "pt")   # idioma de Aurora
+GROUP_LANGUAGE = (os.getenv("GROUP_LANGUAGE", "de") or "de").lower()  # group default: German
+MODEL_LANGUAGE = (os.getenv("MODEL_LANGUAGE", "pt") or "pt").lower()  # model default: Portuguese
+BOT_NAME = os.getenv("BOT_NAME", "Aurora 🔥 Live")
 
-# =========================
-# PERSISTENCIA
-# =========================
+STATE_FILE = os.path.join(DATA_DIR, "state.json")
+
+# State format:
+# {
+#   "groups": {
+#       "<group_chat_id>": {
+#           "streamer_user_id": 123,
+#           "streamer_name": "Aurora",
+#           "live": true
+#       }
+#   }
+# }
+DEFAULT_STATE = {"groups": {}}
+
+
 def load_state() -> Dict[str, Any]:
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            logger.exception("No se pudo leer state.json, creando uno nuevo.")
-    return {
-        "bound_chat_id": None,          # chat donde se publica (grupo/canal)
-        "owner_user_id": None,          # el primero que haga /bindhere será el owner
-        "streamer_user_id": None,       # user_id de Aurora
-        "streamer_name": None,          # nombre opcional
-        "group_lang": DEFAULT_GROUP_LANG,
-        "model_lang": DEFAULT_MODEL_LANG,
-    }
+    if not os.path.exists(STATE_FILE):
+        return json.loads(json.dumps(DEFAULT_STATE))
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return json.loads(json.dumps(DEFAULT_STATE))
+
 
 def save_state(state: Dict[str, Any]) -> None:
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STATE_FILE)
+
 
 STATE = load_state()
 
-# =========================
-# TRADUCCIÓN (Deep Translator)
-# =========================
+
+def get_group_cfg(chat_id: int) -> Dict[str, Any]:
+    gid = str(chat_id)
+    if "groups" not in STATE:
+        STATE["groups"] = {}
+    if gid not in STATE["groups"]:
+        STATE["groups"][gid] = {
+            "streamer_user_id": None,
+            "streamer_name": None,
+            "live": False,
+        }
+        save_state(STATE)
+    return STATE["groups"][gid]
+
+
+def is_admin_user(user_id: int) -> bool:
+    # Si quieres, puedes fijar un ADMIN_USER_ID en env para bloquear comandos.
+    admin_env = os.getenv("ADMIN_USER_ID", "").strip()
+    if not admin_env:
+        return True  # si no hay ADMIN_USER_ID, no bloqueamos (modo simple)
+    try:
+        return int(admin_env) == int(user_id)
+    except Exception:
+        return False
+
+
+# -----------------------------
+# TRANSLATION + STYLE
+# -----------------------------
 def translate_text(text: str, source: str, target: str) -> str:
     text = (text or "").strip()
     if not text:
         return ""
-    if source == target:
+    if GoogleTranslator is None:
+        # Sin deep-translator instalado, devolvemos original
         return text
     try:
-        from deep_translator import GoogleTranslator
         return GoogleTranslator(source=source, target=target).translate(text)
     except Exception:
-        logger.exception("Fallo traducción. Devuelvo texto original.")
         return text
 
-# =========================
-# HELPERS
-# =========================
-def is_owner(user_id: int) -> bool:
-    return STATE.get("owner_user_id") == user_id
 
-def require_owner(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update.effective_user:
-            return
-        uid = update.effective_user.id
-        if STATE.get("owner_user_id") is None:
-            # si aún no hay owner, el primero que haga /bindhere será owner (controlado en bindhere)
-            await update.effective_message.reply_text("⚠️ Primero usa /bindhere en el grupo para establecer el owner y el chat.")
-            return
-        if not is_owner(uid):
-            await update.effective_message.reply_text("⛔ Solo el owner/admin configurado puede usar este comando.")
-            return
-        return await func(update, context)
-    return wrapper
+def spice_german(text: str) -> str:
+    """Make German informal + sexy-ish and remove formal Sie."""
+    t = (text or "").strip()
+    if not t:
+        return ""
 
-# =========================
-# COMANDOS
-# =========================
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "✅ Bot funcionando correctamente.\n"
-        "Si eres streamer/modelo: solo escribe normal aquí.\n"
-        "Si eres owner: usa /bindhere en el grupo y luego /setstreamer respondiendo a un mensaje de Aurora."
+    # Quitar formalidades típicas y unificar informal
+    replacements = [
+        ("Sie ", "du "),
+        ("Sie?", "du?"),
+        ("Sie!", "du!"),
+        ("Ihnen", "dir"),
+        ("Ihr ", "dein "),
+        ("Ihre ", "deine "),
+        ("Ihrem", "deinem"),
+        ("Ihren", "deinen"),
+        ("Ihres", "deines"),
+        ("Sehr geehrte", "Hey"),
+        ("Guten Tag", "Hey"),
+        ("Hallo", "Hey du 😘"),
+        ("Möchten Sie", "Hast du Lust"),
+        ("Wollen Sie", "Hast du Lust"),
+        ("Möchtest du", "Hast du Lust"),
+        ("Ich bin bereit", "Ich bin ganz bereit für dich"),
+        ("Ich warte auf dich", "Ich warte heiß auf dich"),
+        ("Ich freue mich", "Ich freue mich richtig auf dich"),
+        ("mein Lieber", "mein Süßer"),
+        ("meine Liebe", "meine Schöne"),
+    ]
+
+    for a, b in replacements:
+        t = t.replace(a, b)
+
+    # Ajustes suaves para hacerlo más “streamer real”
+    # Evitar mezclas raras Sie/dich: si aparece "Sie" lo bajamos
+    t = t.replace(" Sie", " du")
+    t = t.replace(" Ihnen", " dir")
+
+    # Pequeños toques sin ser porno explícito
+    # (puedes editar estas líneas si quieres aún más caliente)
+    if "Lust" in t and "😈" not in t:
+        t = "🔥 " + t
+    return t
+
+
+def force_plural_group(text: str) -> str:
+    """Force plural (ihr/euch) for group style. Keeps it consistent."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+
+    plural_replacements = [
+        ("du ", "ihr "),
+        (" dich", " euch"),
+        (" dir", " euch"),
+        (" dein ", " euer "),
+        (" deine ", " eure "),
+        (" deinem ", " eurem "),
+        (" deinen ", " euren "),
+        ("deinem", "eurem"),
+        ("deinen", "euren"),
+        ("deine", "eure"),
+        ("dein", "euer"),
+        ("mein Süßer", "meine Süßen"),
+        ("meine Schöne", "meine Süßen"),
+        ("mein Schatz", "meine Schätze"),
+    ]
+
+    for a, b in plural_replacements:
+        t = t.replace(a, b)
+
+    # Si queda "ihr" y luego "dir", arreglar
+    t = t.replace(" dir", " euch")
+    t = t.replace(" dich", " euch")
+    return t
+
+
+def hot_caption_de_plural() -> str:
+    # Caption default (alemán informal, plural, sexy)
+    options = [
+        "🔥 Hey meine Süßen 😘 Ich bin jetzt live… wer von euch hat Lust auf mehr?",
+        "😈 Na ihr… seid ihr bereit? Kommt näher…",
+        "🔥 Ich vermisse euch… schreibt mir, was ihr gerade wollt 😘",
+        "💋 Hey ihr Schätze… ich bin heiß drauf, euch heute zu verwöhnen…",
+        "🔥 Ihr wollt mich sehen? Dann macht euch bereit 😘",
+    ]
+    return options[int(time.time()) % len(options)]
+
+
+def format_as_aurora(text: str, aurora_name: str) -> str:
+    # Para que se vea que es “Aurora” hablando, aunque el mensaje lo envíe el bot
+    # (Telegram no permite que el bot “se haga pasar” por su cuenta)
+    return f"🔥 {aurora_name}:\n{text}".strip()
+
+
+# -----------------------------
+# COMMANDS
+# -----------------------------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"✅ {BOT_NAME} listo.\n\n"
+        "Comandos:\n"
+        "- /whoami (ver tu user_id)\n"
+        "- En el grupo: responde a Aurora y escribe /setstreamer\n"
+        "- Aurora (privado): /liveon y /liveoff\n"
     )
 
-async def whoami_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    chat = update.effective_chat
-    await update.effective_message.reply_text(
-        f"👤 user_id: {u.id}\n"
-        f"🗣 username: @{u.username}" if u.username else f"👤 user_id: {u.id}\n🗣 username: (sin username)\n"
-        f"💬 chat_id: {chat.id}\n"
-        f"💬 chat_type: {chat.type}"
+    await update.message.reply_text(
+        f"👤 Tu user_id: {u.id}\n"
+        f"Nombre: {u.full_name}\n"
+        f"Username: @{u.username}" if u.username else f"Username: (sin @)"
     )
 
-@require_owner
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "📌 Estado actual:\n"
-        f"- bound_chat_id: {STATE.get('bound_chat_id')}\n"
-        f"- owner_user_id: {STATE.get('owner_user_id')}\n"
-        f"- streamer_user_id: {STATE.get('streamer_user_id')}\n"
-        f"- streamer_name: {STATE.get('streamer_name')}\n"
-        f"- group_lang: {STATE.get('group_lang')}\n"
-        f"- model_lang: {STATE.get('model_lang')}"
-    )
 
-async def bindhere_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Se ejecuta EN EL GRUPO donde quieres que el bot publique.
-    El primero que ejecute esto se vuelve owner.
-    """
-    if not update.effective_user or not update.effective_chat:
+async def cmd_setstreamer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or msg.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await msg.reply_text("❌ Usa /setstreamer dentro del grupo y respondiendo a un mensaje de Aurora.")
         return
 
-    chat = update.effective_chat
-    user = update.effective_user
+    if not is_admin_user(update.effective_user.id):
+        await msg.reply_text("❌ No autorizado.")
+        return
 
-    # Solo tiene sentido en grupos/supergrupos/canales vinculados (canales no tienen mensajes normales del bot)
-    # Pero lo permitimos igualmente si el bot recibe el comando allí.
-    STATE["bound_chat_id"] = chat.id
-
-    if STATE.get("owner_user_id") is None:
-        STATE["owner_user_id"] = user.id
-
-    save_state(STATE)
-
-    await update.effective_message.reply_text(
-        "✅ Chat vinculado.\n"
-        f"bound_chat_id = {chat.id}\n"
-        f"owner_user_id = {STATE.get('owner_user_id')}\n\n"
-        "Siguiente paso:\n"
-        "1) Aurora manda un mensaje aquí (solo 1 vez).\n"
-        "2) Tú respondes a su mensaje y ejecutas /setstreamer"
-    )
-
-@require_owner
-async def setstreamer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Debe ejecutarse COMO REPLY a un mensaje de Aurora.
-    Así no necesitas @ ni IDs.
-    """
-    msg = update.effective_message
     if not msg.reply_to_message or not msg.reply_to_message.from_user:
-        await msg.reply_text("⚠️ Usa /setstreamer RESPONDIENDO (reply) a un mensaje de Aurora en este chat.")
+        await msg.reply_text("❌ Responde al mensaje de Aurora y luego escribe /setstreamer.")
         return
 
     target_user = msg.reply_to_message.from_user
-    STATE["streamer_user_id"] = target_user.id
-    STATE["streamer_name"] = target_user.full_name
+    cfg = get_group_cfg(msg.chat_id)
+    cfg["streamer_user_id"] = target_user.id
+    cfg["streamer_name"] = target_user.first_name or "Aurora"
+    cfg["live"] = False  # empieza apagado
+
     save_state(STATE)
 
     await msg.reply_text(
         "✅ Streamer seleccionado.\n"
-        f"Streamer: {target_user.full_name}\n"
-        f"user_id: {target_user.id}\n\n"
+        f"Streamer: {cfg['streamer_name']}\n"
+        f"user_id: {cfg['streamer_user_id']}\n\n"
         "Prueba ahora:\n"
-        "- En el grupo escribe algo en alemán → se enviará traducido al privado del streamer.\n"
-        "- En privado, el streamer escribe algo → se publicará traducido aquí."
+        "- Aurora abre el bot en privado y escribe /start\n"
+        "- Luego Aurora usa /liveon para activar traducción sexy\n"
     )
 
-@require_owner
-async def setlangs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /setlangs de pt
-    group_lang model_lang
-    """
-    msg = update.effective_message
-    if len(context.args) != 2:
-        await msg.reply_text("Uso: /setlangs <group_lang> <model_lang>\nEj: /setlangs de pt")
-        return
-    STATE["group_lang"] = context.args[0].strip().lower()
-    STATE["model_lang"] = context.args[1].strip().lower()
-    save_state(STATE)
-    await msg.reply_text(f"✅ Idiomas guardados: group={STATE['group_lang']} model={STATE['model_lang']}")
 
-# =========================
-# FLUJOS DE MENSAJES
-# =========================
+async def cmd_liveon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or msg.chat.type != ChatType.PRIVATE:
+        await msg.reply_text("❌ /liveon se usa en privado.")
+        return
+
+    user_id = update.effective_user.id
+
+    # Buscar qué grupo tiene a este usuario como streamer
+    found = False
+    for gid, cfg in STATE.get("groups", {}).items():
+        if cfg.get("streamer_user_id") == user_id:
+            cfg["live"] = True
+            save_state(STATE)
+            found = True
+            await msg.reply_text(
+                "✅ LIVE ON.\n"
+                "Ahora:\n"
+                "- Lo que tú escribas (PT) → se publica en el grupo (DE) sexy + informal + plural.\n"
+                "- Lo que escriban en el grupo (DE) → te llega (PT) en privado.\n"
+            )
+    if not found:
+        await msg.reply_text("❌ No estás registrada como streamer en ningún grupo. (Usa /setstreamer en el grupo).")
+
+
+async def cmd_liveoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or msg.chat.type != ChatType.PRIVATE:
+        await msg.reply_text("❌ /liveoff se usa en privado.")
+        return
+
+    user_id = update.effective_user.id
+    found = False
+    for gid, cfg in STATE.get("groups", {}).items():
+        if cfg.get("streamer_user_id") == user_id:
+            cfg["live"] = False
+            save_state(STATE)
+            found = True
+            await msg.reply_text("⛔ LIVE OFF. Traducción apagada.")
+    if not found:
+        await msg.reply_text("❌ No estás registrada como streamer en ningún grupo.")
+
+
+# -----------------------------
+# MESSAGE ROUTING
+# -----------------------------
+def get_bound_group_for_streamer(streamer_user_id: int) -> Optional[int]:
+    for gid, cfg in STATE.get("groups", {}).items():
+        if cfg.get("streamer_user_id") == streamer_user_id:
+            return int(gid)
+    return None
+
+
 async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Mensajes escritos en el grupo:
-    -> se traducen y se mandan por privado al streamer (Aurora)
-    """
-    if not update.effective_chat or not update.effective_user:
+    msg = update.message
+    if not msg or msg.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
-    chat_id = update.effective_chat.id
-    if STATE.get("bound_chat_id") != chat_id:
-        return  # ignorar otros chats
 
-    streamer_id = STATE.get("streamer_user_id")
+    cfg = get_group_cfg(msg.chat_id)
+    if not cfg.get("live"):
+        return  # SOLO cuando LIVE ON
+
+    streamer_id = cfg.get("streamer_user_id")
     if not streamer_id:
-        return  # aún no hay streamer
-
-    # Ignorar mensajes del propio streamer en el grupo (para evitar bucles)
-    if update.effective_user.id == streamer_id:
         return
 
-    text = (update.effective_message.text or "").strip()
+    # Ignorar mensajes del bot
+    if msg.from_user and msg.from_user.is_bot:
+        return
+
+    # Solo texto (por ahora); si mandan stickers/fotos, puedes extender luego
+    text = (msg.text or msg.caption or "").strip()
     if not text:
         return
 
-    # Traduce del idioma del grupo al de la modelo
-    src = STATE.get("group_lang", DEFAULT_GROUP_LANG)
-    tgt = STATE.get("model_lang", DEFAULT_MODEL_LANG)
-    translated = translate_text(text, source=src, target=tgt)
+    sender = msg.from_user.full_name if msg.from_user else "Alguien"
+    # DE -> PT
+    pt = translate_text(text, source=GROUP_LANGUAGE, target=MODEL_LANGUAGE)
+    await context.bot.send_message(
+        chat_id=streamer_id,
+        text=f"📩 {sender} (grupo):\n{pt}",
+    )
 
-    sender = update.effective_user.full_name
-    out = f"💬 {sender}:\n{translated}"
-
-    try:
-        await context.bot.send_message(chat_id=streamer_id, text=out)
-    except Exception:
-        # Si Aurora no abrió el bot, Telegram no deja escribirle
-        logger.exception("No pude enviar DM al streamer. Probable: streamer no inició chat con el bot.")
-        # Aviso suave al grupo (solo una vez por minuto para no spamear)
-        now = int(time.time())
-        last = context.chat_data.get("last_dm_warn", 0)
-        if now - last > 60:
-            context.chat_data["last_dm_warn"] = now
-            await update.effective_message.reply_text(
-                "⚠️ No pude enviar el DM al streamer.\n"
-                "Aurora debe abrir el chat con el bot y pulsar Start una vez (requisito de Telegram)."
-            )
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Mensajes privados:
-    - Si los manda el streamer: traducir y publicar en el grupo
-    - Si los manda el owner: responder status rápido
-    """
-    if not update.effective_chat or not update.effective_user:
-        return
-    if update.effective_chat.type != "private":
+    msg = update.message
+    if not msg or msg.chat.type != ChatType.PRIVATE:
         return
 
-    uid = update.effective_user.id
-    text = (update.effective_message.text or "").strip()
-    if not text:
+    user_id = update.effective_user.id
+
+    # ¿Es streamer de algún grupo?
+    group_id = get_bound_group_for_streamer(user_id)
+    if not group_id:
         return
 
-    bound_chat = STATE.get("bound_chat_id")
-    if not bound_chat:
-        await update.effective_message.reply_text("⚠️ Aún no hay chat vinculado. Owner debe usar /bindhere en el grupo.")
+    cfg = get_group_cfg(group_id)
+    if not cfg.get("live"):
+        return  # SOLO cuando LIVE ON
+
+    aurora_name = cfg.get("streamer_name") or "Aurora"
+
+    # Si es texto normal:
+    if msg.text:
+        pt_text = msg.text.strip()
+        de = translate_text(pt_text, source=MODEL_LANGUAGE, target=GROUP_LANGUAGE)
+        de = spice_german(de)
+        de = force_plural_group(de)
+        out = format_as_aurora(de, aurora_name)
+        await context.bot.send_message(chat_id=group_id, text=out)
         return
 
-    streamer_id = STATE.get("streamer_user_id")
+    # Si es foto/video con caption opcional:
+    caption = (msg.caption or "").strip()
 
-    # Si es streamer, publica al grupo
-    if streamer_id and uid == streamer_id:
-        src = STATE.get("model_lang", DEFAULT_MODEL_LANG)
-        tgt = STATE.get("group_lang", DEFAULT_GROUP_LANG)
-        translated = translate_text(text, source=src, target=tgt)
-        try:
-            await context.bot.send_message(chat_id=bound_chat, text=f"🔥 {translated}")
-        except Exception:
-            logger.exception("No pude publicar en el grupo. ¿Bot tiene permisos?")
-            await update.effective_message.reply_text("⚠️ No pude publicar en el grupo. Revisa permisos del bot en el grupo.")
-        return
+    # Determinar caption en alemán
+    if caption:
+        de = translate_text(caption, source=MODEL_LANGUAGE, target=GROUP_LANGUAGE)
+        de = spice_german(de)
+        de = force_plural_group(de)
+    else:
+        de = hot_caption_de_plural()
 
-    # Si es owner, feedback rápido
-    if is_owner(uid):
-        await update.effective_message.reply_text(
-            "✅ Owner DM.\n"
-            "Recuerda: /bindhere en el grupo, luego /setstreamer respondiendo al mensaje de Aurora."
-        )
-        return
+    out_caption = format_as_aurora(de, aurora_name)
 
-    # Otros privados: ignorar o mensaje neutro
-    await update.effective_message.reply_text("✅ Bot activo. Escribe en el grupo para comunicarte.")
+    # Reenviar media al grupo con caption
+    try:
+        if msg.photo:
+            # mayor tamaño
+            photo = msg.photo[-1]
+            await context.bot.send_photo(chat_id=group_id, photo=photo.file_id, caption=out_caption)
+            return
+        if msg.video:
+            await context.bot.send_video(chat_id=group_id, video=msg.video.file_id, caption=out_caption)
+            return
+    except Exception:
+        # Si falla el reenvío, al menos manda el texto
+        await context.bot.send_message(chat_id=group_id, text=out_caption)
 
-# =========================
-# FLASK KEEP ALIVE
-# =========================
+
+# -----------------------------
+# FLASK KEEP-ALIVE (Render)
+# -----------------------------
 flask_app = Flask(__name__)
 
 @flask_app.get("/")
 def home():
     return "OK", 200
 
+
 def run_flask():
-    port = int(os.environ.get("PORT", "10000"))
+    port = int(os.getenv("PORT", "10000"))
     flask_app.run(host="0.0.0.0", port=port)
 
-# =========================
+
+# -----------------------------
 # MAIN
-# =========================
+# -----------------------------
 def main():
-    # levanta Flask en thread para Render
-    import threading
+    # Start Flask on a background thread
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
 
-    app = Application.builder().token(TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # comandos
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("whoami", whoami_cmd))
-    app.add_handler(CommandHandler("bindhere", bindhere_cmd))
-    app.add_handler(CommandHandler("setstreamer", setstreamer_cmd))
-    app.add_handler(CommandHandler("setlangs", setlangs_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
+    # Commands
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("whoami", cmd_whoami))
 
-    # mensajes
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, handle_group_message))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_private_message))
+    # Group: select streamer by replying
+    app.add_handler(CommandHandler("setstreamer", cmd_setstreamer))
 
-    logger.info("Bot iniciado. Polling...")
+    # Private: live control
+    app.add_handler(CommandHandler("liveon", cmd_liveon))
+    app.add_handler(CommandHandler("liveoff", cmd_liveoff))
+
+    # Messages
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS, handle_group_message))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE, handle_private_message))
+
+    # Polling (sync)
     app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
