@@ -1,5 +1,6 @@
 # app.py
 # CosplayLive Translate Bot (PTB v13.15) + streamer selection + LIVE toggle + promo queue every 2h
+# + MULTI-ROOM ROUTING via DM reply (no confusión entre FREE/VIP/LIVECHAT)
 # Compatible con: python-telegram-bot==13.15
 
 import os
@@ -21,23 +22,26 @@ from telegram.ext import (
 # =========================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or os.getenv("TOKEN")
 DATA_DIR = os.getenv("DATA_DIR", "/var/data")
-
 GROUP_LANGUAGE = os.getenv("GROUP_LANGUAGE", "de")   # idioma del grupo (Alemania)
 MODEL_LANGUAGE = os.getenv("MODEL_LANGUAGE", "pt")   # idioma de la modelo (Brasil/Portugal)
-
 PROMO_INTERVAL_SECONDS = int(os.getenv("PROMO_INTERVAL_SECONDS", str(2 * 60 * 60)))  # default 2h
 WELCOME_ON_JOIN = os.getenv("WELCOME_ON_JOIN", "1") == "1"
+
+os.makedirs(DATA_DIR, exist_ok=True)
 
 # =========================
 # Files
 # =========================
-os.makedirs(DATA_DIR, exist_ok=True)
-ROOMS_FILE = os.path.join(DATA_DIR, "rooms.json")         # model_user_id -> group_chat_id
-MODELS_FILE = os.path.join(DATA_DIR, "models.json")       # model_user_id -> model_name
-LIVE_FILE = os.path.join(DATA_DIR, "live.json")           # model_user_id -> true/false
-STREAMERS_FILE = os.path.join(DATA_DIR, "streamers.json") # group_chat_id -> model_user_id
-INTRO_FILE = os.path.join(DATA_DIR, "intro.json")         # group_chat_id -> intro_text
-QUEUE_FILE = os.path.join(DATA_DIR, "queue.json")         # model_user_id -> {"items":[...], "last_sent": epoch}
+ROOMS_FILE = os.path.join(DATA_DIR, "rooms.json")          # model_user_id -> group_chat_id (legacy/fallback)
+MODELS_FILE = os.path.join(DATA_DIR, "models.json")        # model_user_id -> model_name
+LIVE_FILE = os.path.join(DATA_DIR, "live.json")            # model_user_id -> true/false
+STREAMERS_FILE = os.path.join(DATA_DIR, "streamers.json")  # group_chat_id -> model_user_id
+INTRO_FILE = os.path.join(DATA_DIR, "intro.json")          # group_chat_id -> intro_text
+QUEUE_FILE = os.path.join(DATA_DIR, "queue.json")          # model_user_id -> {"items":[...], "last_sent": epoch}
+
+# NUEVO: routing multi-room
+BRIDGE_FILE = os.path.join(DATA_DIR, "bridge.json")        # model_user_id -> { dm_message_id : group_chat_id }
+LAST_FILE = os.path.join(DATA_DIR, "last.json")            # model_user_id -> last_group_chat_id (fallback)
 
 # =========================
 # Safe JSON helpers
@@ -65,9 +69,11 @@ def load_all():
         streamers = _read_json(STREAMERS_FILE, {})
         intro = _read_json(INTRO_FILE, {})
         queue = _read_json(QUEUE_FILE, {})
-    return rooms, models, live, streamers, intro, queue
+        bridge = _read_json(BRIDGE_FILE, {})
+        last = _read_json(LAST_FILE, {})
+    return rooms, models, live, streamers, intro, queue, bridge, last
 
-def save_all(rooms=None, models=None, live=None, streamers=None, intro=None, queue=None):
+def save_all(rooms=None, models=None, live=None, streamers=None, intro=None, queue=None, bridge=None, last=None):
     with _lock:
         if rooms is not None: _write_json(ROOMS_FILE, rooms)
         if models is not None: _write_json(MODELS_FILE, models)
@@ -75,6 +81,8 @@ def save_all(rooms=None, models=None, live=None, streamers=None, intro=None, que
         if streamers is not None: _write_json(STREAMERS_FILE, streamers)
         if intro is not None: _write_json(INTRO_FILE, intro)
         if queue is not None: _write_json(QUEUE_FILE, queue)
+        if bridge is not None: _write_json(BRIDGE_FILE, bridge)
+        if last is not None: _write_json(LAST_FILE, last)
 
 # =========================
 # Translator (optional)
@@ -101,7 +109,6 @@ def is_group_chat(chat) -> bool:
     return chat.type in ("group", "supergroup")
 
 def sexy_fallback_line(lang: str) -> str:
-    # sugerente, no ultra explícito
     if lang == "de":
         return "🔥 Na ihr… habt ihr Lust auf was ganz Privates? 😈"
     if lang == "pt":
@@ -109,7 +116,6 @@ def sexy_fallback_line(lang: str) -> str:
     return "🔥 Hey… want something private? 😈"
 
 def format_informal_hint_de(text: str) -> str:
-    # heurística simple para evitar Sie/dich mezclado
     t = text
     t = t.replace("Möchten Sie", "Wollt ihr")
     t = t.replace("Möchtest du", "Willst du")
@@ -121,27 +127,32 @@ def format_informal_hint_de(text: str) -> str:
 def get_bound_model_for_group(group_chat_id: str, streamers: dict) -> str:
     return streamers.get(str(group_chat_id), "")
 
-def get_group_for_model(model_user_id: str, rooms: dict) -> str:
-    return rooms.get(str(model_user_id), "")
-
 def is_live(model_user_id: str, live: dict) -> bool:
     return bool(live.get(str(model_user_id), False))
 
-def find_group_for_streamer_fallback(model_user_id: str, rooms: dict, streamers: dict) -> str:
-    """
-    FIX CLAVE:
-    Si rooms no tiene el grupo para este streamer,
-    buscamos en streamers (group->streamer) el grupo donde esté seleccionado.
-    """
-    # 1) normal
+def find_group_for_streamer_fallback(model_user_id: str, rooms: dict, streamers: dict, last: dict) -> str:
+    # 0) último grupo usado (si existe)
+    g = last.get(str(model_user_id), "")
+    if g:
+        return g
+
+    # 1) legacy rooms
     g = rooms.get(str(model_user_id), "")
     if g:
         return g
-    # 2) fallback inverso
+
+    # 2) reverse from streamers
     for group_id, streamer_id in (streamers or {}).items():
         if str(streamer_id) == str(model_user_id):
             return str(group_id)
     return ""
+
+def group_label(group_chat_id: str, chat_title: str) -> str:
+    # etiqueta simple: usa el título si existe
+    title = (chat_title or "").strip()
+    if not title:
+        return f"CHAT {group_chat_id}"
+    return title[:28]
 
 # =========================
 # Commands
@@ -161,7 +172,8 @@ def cmd_setmodel(update: Update, context: CallbackContext):
     user = update.effective_user
     if not user:
         return
-    rooms, models, live, streamers, intro, queue = load_all()
+
+    rooms, models, live, streamers, intro, queue, bridge, last = load_all()
     if not name:
         update.message.reply_text("Uso: /setmodel <Nombre>\nEj: /setmodel Aurora")
         return
@@ -170,6 +182,7 @@ def cmd_setmodel(update: Update, context: CallbackContext):
     update.message.reply_text(f"✅ Modelo registrada: {name}\nuser_id: {user.id}")
 
 def cmd_bindchat(update: Update, context: CallbackContext):
+    # legacy (mantener)
     if not update.message or not is_group_chat(update.effective_chat):
         return
     args = context.args
@@ -178,7 +191,7 @@ def cmd_bindchat(update: Update, context: CallbackContext):
         return
     model_user_id = args[0].strip()
     group_chat_id = str(update.effective_chat.id)
-    rooms, models, live, streamers, intro, queue = load_all()
+    rooms, models, live, streamers, intro, queue, bridge, last = load_all()
     rooms[model_user_id] = group_chat_id
     save_all(rooms=rooms)
     update.message.reply_text(f"✅ Grupo vinculado.\nmodel_user_id: {model_user_id}\nchat_id: {group_chat_id}")
@@ -186,6 +199,7 @@ def cmd_bindchat(update: Update, context: CallbackContext):
 def cmd_setstreamer(update: Update, context: CallbackContext):
     if not update.message or not is_group_chat(update.effective_chat):
         return
+
     group_chat_id = str(update.effective_chat.id)
     reply = update.message.reply_to_message
     if not reply or not reply.from_user:
@@ -195,11 +209,10 @@ def cmd_setstreamer(update: Update, context: CallbackContext):
     streamer_user = reply.from_user
     streamer_id = str(streamer_user.id)
 
-    rooms, models, live, streamers, intro, queue = load_all()
-
+    rooms, models, live, streamers, intro, queue, bridge, last = load_all()
     streamers[group_chat_id] = streamer_id
 
-    # IMPORTANTÍSIMO: asegurar rooms también
+    # asegurar fallback legacy
     rooms[streamer_id] = group_chat_id
 
     if streamer_id not in models:
@@ -211,9 +224,8 @@ def cmd_setstreamer(update: Update, context: CallbackContext):
         "✅ Streamer seleccionado.\n"
         f"Streamer: {models.get(streamer_id, 'Streamer')}\n"
         f"user_id: {streamer_id}\n\n"
-        "Prueba ahora:\n"
-        "- En el grupo escribe algo → se enviará traducido al privado del streamer.\n"
-        "- En privado, el streamer escribe algo → se publicará traducido aquí.",
+        "Ahora este grupo queda atendido por esa modelo.\n"
+        "Con LIVE ON, todo se traduce en ambos sentidos.",
         parse_mode=ParseMode.HTML
     )
 
@@ -223,7 +235,7 @@ def cmd_liveon(update: Update, context: CallbackContext):
     user = update.effective_user
     if not user:
         return
-    rooms, models, live, streamers, intro, queue = load_all()
+    rooms, models, live, streamers, intro, queue, bridge, last = load_all()
     live[str(user.id)] = True
     save_all(live=live)
     update.message.reply_text("🟢 LIVE ON ✅\nDesde ahora se traduce en ambos sentidos + cola habilitada.")
@@ -234,7 +246,7 @@ def cmd_liveoff(update: Update, context: CallbackContext):
     user = update.effective_user
     if not user:
         return
-    rooms, models, live, streamers, intro, queue = load_all()
+    rooms, models, live, streamers, intro, queue, bridge, last = load_all()
     live[str(user.id)] = False
     save_all(live=live)
     update.message.reply_text("🔴 LIVE OFF ✅\nSe detiene traducción y cola.")
@@ -246,7 +258,7 @@ def cmd_intro(update: Update, context: CallbackContext):
     if not text:
         update.message.reply_text("Uso: /intro <texto>\nEj: /intro Soy Aurora 🔥 23 🇧🇷 ...")
         return
-    rooms, models, live, streamers, intro, queue = load_all()
+    rooms, models, live, streamers, intro, queue, bridge, last = load_all()
     group_chat_id = str(update.effective_chat.id)
     intro[group_chat_id] = text
     save_all(intro=intro)
@@ -265,11 +277,10 @@ def cmd_queue(update: Update, context: CallbackContext):
         "  #cola  o  /cola\n"
         "✅ Eso lo encola.\n"
         "Si NO pones #cola → se publica inmediatamente.\n\n"
-        "La cola se suelta cada 2 horas mientras LIVE esté ON."
+        "La cola se suelta cada X tiempo mientras LIVE esté ON."
     )
 
 def cmd_cola_alias(update: Update, context: CallbackContext):
-    # alias español para que a Aurora le sea fácil
     return cmd_queue(update, context)
 
 # =========================
@@ -282,7 +293,8 @@ def handle_group_text(update: Update, context: CallbackContext):
     if not text:
         return
 
-    rooms, models, live, streamers, intro, queue = load_all()
+    rooms, models, live, streamers, intro, queue, bridge, last = load_all()
+
     group_chat_id = str(update.effective_chat.id)
     model_user_id = get_bound_model_for_group(group_chat_id, streamers)
     if not model_user_id:
@@ -291,11 +303,30 @@ def handle_group_text(update: Update, context: CallbackContext):
         return
 
     translated = translate_text(text, GROUP_LANGUAGE, MODEL_LANGUAGE)
+
+    # etiqueta para Aurora (para que vea de qué grupo viene)
+    label = group_label(group_chat_id, update.effective_chat.title)
+    sender = update.effective_user
+    sender_name = ("@" + sender.username) if sender and sender.username else (sender.first_name if sender else "user")
+
+    dm_text = f"💬 <b>[{label}]</b> {sender_name}:\n{translated}"
+
     try:
-        context.bot.send_message(
+        sent = context.bot.send_message(
             chat_id=int(model_user_id),
-            text=f"💬 (del grupo) {translated}"
+            text=dm_text,
+            parse_mode=ParseMode.HTML
         )
+
+        # ✅ guardamos routing: si Aurora responde (reply) a este DM, volvemos al grupo correcto
+        bridge.setdefault(str(model_user_id), {})
+        bridge[str(model_user_id)][str(sent.message_id)] = group_chat_id
+
+        # ✅ guardamos último grupo activo para fallback (media / mensajes sin reply)
+        last[str(model_user_id)] = group_chat_id
+
+        save_all(bridge=bridge, last=last)
+
     except Exception:
         pass
 
@@ -306,19 +337,25 @@ def handle_private_text(update: Update, context: CallbackContext):
     if not user:
         return
 
-    rooms, models, live, streamers, intro, queue = load_all()
+    rooms, models, live, streamers, intro, queue, bridge, last = load_all()
     model_user_id = str(user.id)
 
-    # si no está live, no manda
     if not is_live(model_user_id, live):
-        # feedback útil, así sabes por qué no manda
         update.message.reply_text("⚠️ No estás en LIVE. Usa /liveon para habilitar envío al grupo.")
         return
 
-    # ✅ FIX: buscar grupo normal y fallback en streamers.json
-    group_chat_id = find_group_for_streamer_fallback(model_user_id, rooms, streamers)
-    if not group_chat_id:
-        update.message.reply_text("⚠️ No encuentro tu grupo vinculado. Ve al grupo y usa /setstreamer respondiendo a tu mensaje.")
+    # ✅ SI AURORA RESPONDE (REPLY) -> se manda al grupo correcto
+    target_group = ""
+    if update.message.reply_to_message:
+        replied_id = str(update.message.reply_to_message.message_id)
+        target_group = (bridge.get(model_user_id) or {}).get(replied_id, "")
+
+    # fallback: último grupo activo / legacy
+    if not target_group:
+        target_group = find_group_for_streamer_fallback(model_user_id, rooms, streamers, last)
+
+    if not target_group:
+        update.message.reply_text("⚠️ No encuentro el grupo destino. Ve al grupo y usa /setstreamer respondiendo a tu mensaje.")
         return
 
     text = (update.message.text or "").strip()
@@ -330,15 +367,12 @@ def handle_private_text(update: Update, context: CallbackContext):
         translated = format_informal_hint_de(translated)
 
     try:
-        context.bot.send_message(
-            chat_id=int(group_chat_id),
-            text=translated
-        )
+        context.bot.send_message(chat_id=int(target_group), text=translated)
     except Exception:
         pass
 
 def enqueue_media(model_user_id: str, item: dict):
-    rooms, models, live, streamers, intro, queue = load_all()
+    rooms, models, live, streamers, intro, queue, bridge, last = load_all()
     q = queue.get(model_user_id) or {"items": [], "last_sent": 0}
     q["items"].append(item)
     queue[model_user_id] = q
@@ -351,23 +385,25 @@ def handle_private_media(update: Update, context: CallbackContext):
     if not user:
         return
 
-    rooms, models, live, streamers, intro, queue = load_all()
+    rooms, models, live, streamers, intro, queue, bridge, last = load_all()
     model_user_id = str(user.id)
 
     if not is_live(model_user_id, live):
         update.message.reply_text("⚠️ No estás en LIVE. Usa /liveon.")
         return
 
-    group_chat_id = find_group_for_streamer_fallback(model_user_id, rooms, streamers)
+    # Para media: usamos último grupo activo (porque no hay reply fácil con media)
+    group_chat_id = find_group_for_streamer_fallback(model_user_id, rooms, streamers, last)
     if not group_chat_id:
         update.message.reply_text("⚠️ No encuentro tu grupo vinculado. Ve al grupo y usa /setstreamer respondiendo a tu mensaje.")
         return
 
     caption = (update.message.caption or "").strip()
     cap_lower = caption.lower()
-
-    # ✅ ahora es #cola o /cola (más fácil)
-    should_queue = cap_lower.startswith("#cola") or cap_lower.startswith("/cola") or cap_lower.startswith("#queue") or cap_lower.startswith("/queue")
+    should_queue = (
+        cap_lower.startswith("#cola") or cap_lower.startswith("/cola") or
+        cap_lower.startswith("#queue") or cap_lower.startswith("/queue")
+    )
 
     clean_caption = caption
     if should_queue:
@@ -394,7 +430,7 @@ def handle_private_media(update: Update, context: CallbackContext):
 
     if should_queue:
         enqueue_media(model_user_id, item)
-        update.message.reply_text("✅ Guardado en cola. Se publicará cada 2 horas mientras LIVE esté ON.")
+        update.message.reply_text("✅ Guardado en cola. Se publicará cada X tiempo mientras LIVE esté ON.")
         return
 
     try:
@@ -410,7 +446,7 @@ def handle_new_members(update: Update, context: CallbackContext):
         return
     if not WELCOME_ON_JOIN:
         return
-    rooms, models, live, streamers, intro, queue = load_all()
+    rooms, models, live, streamers, intro, queue, bridge, last = load_all()
     group_chat_id = str(update.effective_chat.id)
     intro_text = intro.get(group_chat_id, "")
     if intro_text:
@@ -425,18 +461,18 @@ def handle_new_members(update: Update, context: CallbackContext):
 def promo_loop(bot):
     while True:
         try:
-            rooms, models, live, streamers, intro, queue = load_all()
+            rooms, models, live, streamers, intro, queue, bridge, last = load_all()
             for model_user_id, live_on in list(live.items()):
                 if not live_on:
                     continue
-
-                group_chat_id = find_group_for_streamer_fallback(str(model_user_id), rooms, streamers)
+                group_chat_id = find_group_for_streamer_fallback(str(model_user_id), rooms, streamers, last)
                 if not group_chat_id:
                     continue
 
                 q = queue.get(str(model_user_id)) or {"items": [], "last_sent": 0}
                 items = q.get("items", [])
                 last_sent = int(q.get("last_sent", 0))
+
                 if not items:
                     continue
                 if now_epoch() - last_sent < PROMO_INTERVAL_SECONDS:
@@ -495,29 +531,14 @@ def main():
     dp.add_handler(CommandHandler("queue", cmd_queue))
     dp.add_handler(CommandHandler("cola", cmd_cola_alias))
 
-    # Group text -> model private
+    # Group text -> model private (3 grupos a la vez, sin confusión)
     dp.add_handler(MessageHandler(Filters.chat_type.groups & Filters.text & ~Filters.command, handle_group_text))
 
-    # Private text -> group
+    # Private text -> group (por reply routing)
     dp.add_handler(MessageHandler(Filters.private & Filters.text & ~Filters.command, handle_private_text))
 
     # Private media from model
     dp.add_handler(MessageHandler(Filters.private & (Filters.photo | Filters.video), handle_private_media))
 
     # New members in group
-    dp.add_handler(MessageHandler(Filters.status_update.new_chat_members, handle_new_members))
-
-    # Start Flask in background
-    t_web = threading.Thread(target=run_flask, daemon=True)
-    t_web.start()
-
-    # Start promo scheduler in background
-    t_promo = threading.Thread(target=promo_loop, args=(updater.bot,), daemon=True)
-    t_promo.start()
-
-    # Polling
-    updater.start_polling(drop_pending_updates=True)
-    updater.idle()
-
-if __name__ == "__main__":
-    main()
+    dp.add_handler(MessageHandler(Filters.st
